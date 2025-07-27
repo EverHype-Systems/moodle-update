@@ -7,7 +7,7 @@
 
 Automated Moodle update script with comprehensive backup, security checks, and maintenance mode handling.
 
-## 🚀 Features
+## Features
 
 - **Automated Updates**: Download and install any Moodle version from GitHub releases
 - **Smart Backup System**: Automatic backup of code, database, and critical data
@@ -19,7 +19,7 @@ Automated Moodle update script with comprehensive backup, security checks, and m
 - **Progress Tracking**: Real-time progress with colored output
 - **Web Server Integration**: Automatic web server restart after updates
 
-## 📋 Requirements
+## Requirements
 
 - **Operating System**: Ubuntu/Debian (preferred), CentOS/RHEL compatible
 - **Privileges**: Root access (sudo) required
@@ -28,7 +28,7 @@ Automated Moodle update script with comprehensive backup, security checks, and m
 - **Web Server**: Apache2 or Nginx
 - **Tools**: curl, tar, sed, grep, systemctl
 
-## 🔧 Installation
+## Installation
 
 ### Quick Install
 ```bash
@@ -52,7 +52,7 @@ sha256sum updater.sh
 # Compare with hash from GitHub releases
 ```
 
-## 💻 Usage
+## Usage
 
 ### Basic Usage
 ```bash
@@ -83,7 +83,7 @@ sudo ./updater.sh /opt/moodle /opt/moodledata 4.4.2
 sudo ./updater.sh /home/user/moodle /home/user/moodledata 5.0.0
 ```
 
-## 📁 Directory Structure
+## Directory Structure
 
 The script expects the following structure:
 ```
@@ -100,7 +100,7 @@ The script expects the following structure:
 └── ...                        # Other data files
 ```
 
-## 🔒 Security Features
+## Security Features
 
 ### Backup System
 - **Automatic Backups**: Created before any changes
@@ -119,7 +119,7 @@ The script expects the following structure:
 - **PHP Compatibility**: Validates PHP version requirements
 - **Version Comparison**: Intelligent semantic version comparison
 
-## 🐛 Troubleshooting
+## Troubleshooting
 
 ### Common Issues
 
@@ -175,7 +175,7 @@ Check these locations for detailed error information:
 - PHP logs: `/var/log/php/error.log`
 - Moodle logs: Via Admin → Reports → Logs in Moodle interface
 
-## 📈 Update Process Flow
+## Update Process Flow
 
 1. **Pre-flight Checks**
    - Validate paths and permissions
@@ -210,7 +210,7 @@ Check these locations for detailed error information:
    - Verify installation
    - Display success status
 
-## 🔄 Recovery Process
+## Recovery Process
 
 If an update fails, recovery steps:
 
@@ -234,7 +234,7 @@ If an update fails, recovery steps:
    sudo sed -i '/maintenance_enabled.*true/d' /var/www/html/moodle/config.php
    ```
 
-## 🛠 Advanced Configuration
+## Advanced Configuration
 
 ### Custom PHP Paths
 ```bash
@@ -257,7 +257,7 @@ sudo ufw allow out 443
 sudo ufw allow out 80
 ```
 
-## 📞 Support
+## Support
 
 ### Before Seeking Help
 
@@ -293,7 +293,7 @@ When [reporting issues](https://github.com/EverHype-Systems/moodle-update/issues
 - Error messages
 - Relevant log excerpts
 
-## 🔐 Security Notice
+## Security Notice
 
 **Important Security Considerations:**
 
@@ -304,11 +304,11 @@ When [reporting issues](https://github.com/EverHype-Systems/moodle-update/issues
 - Monitor file permissions after updates
 - Verify database integrity after updates
 
-## 📜 License
+## License
 
 This script is provided as-is for educational and operational purposes. Use at your own risk and always maintain proper backups.
 
-## 🔄 Changelog
+## Changelog
 
 ### v1.0 (Current)
 - Initial release
@@ -321,6 +321,6 @@ This script is provided as-is for educational and operational purposes. Use at y
 
 ---
 
-**Happy Updating! 🚀**
+**Happy Updating!**
 
-For the latest version and updates, visit: [Your Repository URL]
+For the latest version and updates, visit: https://github.com/EverHype-Systems/moodle-update
