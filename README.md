@@ -1,6 +1,6 @@
 # Moodle Updater v1.0
 
-[![GitHub Release](https://img.shields.io/github/v/release/EverHype-Systems/moodle-update)](https://github.com/EverHype-Systems/moodle-update/releases)
+[![GitHub Release](https://img.shields.io/github/v1/release/EverHype-Systems/moodle-update)](https://github.com/EverHype-Systems/moodle-update/releases)
 [![License](https://img.shields.io/github/license/EverHype-Systems/moodle-update)](https://github.com/EverHype-Systems/moodle-update/blob/main/LICENSE)
 [![GitHub Issues](https://img.shields.io/github/issues/EverHype-Systems/moodle-update)](https://github.com/EverHype-Systems/moodle-update/issues)
 [![GitHub Stars](https://img.shields.io/github/stars/EverHype-Systems/moodle-update)](https://github.com/EverHype-Systems/moodle-update/stargazers)
