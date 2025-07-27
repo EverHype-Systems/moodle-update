@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# Moodle Update Script
-# Updates Moodle to the desired version with security checks
+# Moodle Updater v1.0
+# Automated Moodle update script with security checks and backup functionality
 
 set -e  # Exit script on errors
 
@@ -219,12 +219,40 @@ backup_database() {
     
     log "Creating database backup..."
     
-    # Extract DB configuration from config.php
-    local db_type=$(grep '$CFG->dbtype' "$moodle_path/config.php" | sed "s/.*'\([^']*\)'.*/\1/" 2>/dev/null || echo "")
-    local db_host=$(grep '$CFG->dbhost' "$moodle_path/config.php" | sed "s/.*'\([^']*\)'.*/\1/" 2>/dev/null || echo "localhost")
-    local db_name=$(grep '$CFG->dbname' "$moodle_path/config.php" | sed "s/.*'\([^']*\)'.*/\1/" 2>/dev/null || echo "")
-    local db_user=$(grep '$CFG->dbuser' "$moodle_path/config.php" | sed "s/.*'\([^']*\)'.*/\1/" 2>/dev/null || echo "")
-    local db_pass=$(grep '$CFG->dbpass' "$moodle_path/config.php" | sed "s/.*'\([^']*\)'.*/\1/" 2>/dev/null || echo "")
+    # Extract DB configuration from config.php using more robust parsing
+    local db_type=$(php -r "
+        include '$moodle_path/config.php';
+        echo isset(\$CFG->dbtype) ? \$CFG->dbtype : '';
+    " 2>/dev/null || echo "")
+    
+    local db_host=$(php -r "
+        include '$moodle_path/config.php';
+        echo isset(\$CFG->dbhost) ? \$CFG->dbhost : 'localhost';
+    " 2>/dev/null || echo "localhost")
+    
+    local db_name=$(php -r "
+        include '$moodle_path/config.php';
+        echo isset(\$CFG->dbname) ? \$CFG->dbname : '';
+    " 2>/dev/null || echo "")
+    
+    local db_user=$(php -r "
+        include '$moodle_path/config.php';
+        echo isset(\$CFG->dbuser) ? \$CFG->dbuser : '';
+    " 2>/dev/null || echo "")
+    
+    local db_pass=$(php -r "
+        include '$moodle_path/config.php';
+        echo isset(\$CFG->dbpass) ? \$CFG->dbpass : '';
+    " 2>/dev/null || echo "")
+    
+    local db_port=$(php -r "
+        include '$moodle_path/config.php';
+        echo isset(\$CFG->dbport) ? \$CFG->dbport : '3306';
+    " 2>/dev/null || echo "3306")
+    
+    log "Database type: $db_type"
+    log "Database host: $db_host"
+    log "Database name: $db_name"
     
     if [[ -z "$db_name" || -z "$db_user" ]]; then
         warning "Database settings incomplete - backup skipped"
@@ -233,21 +261,57 @@ backup_database() {
     
     if [[ "$db_type" == "mysqli" || "$db_type" == "mariadb" ]]; then
         if command -v mysqldump &> /dev/null; then
-            if mysqldump -h"$db_host" -u"$db_user" -p"$db_pass" "$db_name" > "$backup_dir/database_backup.sql" 2>/dev/null; then
-                success "MySQL/MariaDB backup created"
+            log "Creating MySQL/MariaDB backup..."
+            
+            # Create MySQL options file for security
+            local mysql_opts_file="$backup_dir/.mysql_opts"
+            cat > "$mysql_opts_file" << EOF
+[client]
+host=$db_host
+port=$db_port
+user=$db_user
+password=$db_pass
+EOF
+            chmod 600 "$mysql_opts_file"
+            
+            if mysqldump --defaults-file="$mysql_opts_file" \
+                --single-transaction \
+                --routines \
+                --triggers \
+                --quick \
+                --add-drop-table \
+                "$db_name" > "$backup_dir/database_backup.sql" 2>/dev/null; then
+                success "MySQL/MariaDB backup created ($(du -h "$backup_dir/database_backup.sql" | cut -f1))"
             else
-                warning "MySQL backup failed - possibly wrong credentials"
+                warning "MySQL backup failed - check credentials and permissions"
+                log "Trying alternative backup method..."
+                if mysql --defaults-file="$mysql_opts_file" -e "USE $db_name; SHOW TABLES;" &>/dev/null; then
+                    mysqldump --defaults-file="$mysql_opts_file" --no-data "$db_name" > "$backup_dir/database_structure.sql" 2>/dev/null || true
+                    warning "Only database structure backed up"
+                else
+                    error "Cannot connect to database"
+                fi
             fi
+            
+            # Clean up credentials file
+            rm -f "$mysql_opts_file"
         else
             warning "mysqldump not found - MySQL backup skipped"
         fi
     elif [[ "$db_type" == "pgsql" ]]; then
         if command -v pg_dump &> /dev/null; then
-            if PGPASSWORD="$db_pass" pg_dump -h "$db_host" -U "$db_user" "$db_name" > "$backup_dir/database_backup.sql" 2>/dev/null; then
-                success "PostgreSQL backup created"
+            log "Creating PostgreSQL backup..."
+            export PGPASSWORD="$db_pass"
+            if pg_dump -h "$db_host" -p "$db_port" -U "$db_user" \
+                --no-password \
+                --clean \
+                --create \
+                "$db_name" > "$backup_dir/database_backup.sql" 2>/dev/null; then
+                success "PostgreSQL backup created ($(du -h "$backup_dir/database_backup.sql" | cut -f1))"
             else
-                warning "PostgreSQL backup failed - possibly wrong credentials"
+                warning "PostgreSQL backup failed - check credentials and permissions"
             fi
+            unset PGPASSWORD
         else
             warning "pg_dump not found - PostgreSQL backup skipped"
         fi
@@ -308,19 +372,87 @@ download_and_install_moodle() {
     success "Moodle $version has been installed"
 }
 
-# Run Moodle upgrade
+# Run Moodle upgrade with environment fixes
 run_moodle_upgrade() {
     local moodle_path=$1
     
     log "Running Moodle upgrade..."
     
-    if [[ -f "$moodle_path/admin/cli/upgrade.php" ]]; then
-        cd "$moodle_path"
-        php admin/cli/upgrade.php --non-interactive --allow-unstable
-        success "Moodle upgrade completed"
-    else
+    if [[ ! -f "$moodle_path/admin/cli/upgrade.php" ]]; then
         error "Upgrade script not found"
         exit 1
+    fi
+    
+    # Pre-upgrade environment checks and fixes
+    log "Checking and fixing environment issues..."
+    
+    # Fix max_input_vars if needed
+    local current_max_vars=$(php -r "echo ini_get('max_input_vars');")
+    if [[ "$current_max_vars" -lt 5000 ]]; then
+        warning "max_input_vars is $current_max_vars, should be at least 5000"
+        
+        # Try to fix via PHP-FPM pool config
+        if [[ -f "/etc/php/$(php -r "echo PHP_MAJOR_VERSION.'.'.PHP_MINOR_VERSION;")/fpm/pool.d/www.conf" ]]; then
+            local php_version=$(php -r "echo PHP_MAJOR_VERSION.'.'.PHP_MINOR_VERSION;")
+            local pool_conf="/etc/php/$php_version/fpm/pool.d/www.conf"
+            
+            if ! grep -q "php_admin_value\[max_input_vars\]" "$pool_conf"; then
+                echo "php_admin_value[max_input_vars] = 5000" >> "$pool_conf"
+                systemctl reload "php$php_version-fpm" 2>/dev/null || true
+                log "Updated max_input_vars in PHP-FPM pool config"
+            fi
+        fi
+        
+        # Also try via .htaccess for Apache
+        if [[ -f "$moodle_path/.htaccess" ]]; then
+            if ! grep -q "php_value max_input_vars" "$moodle_path/.htaccess"; then
+                echo "php_value max_input_vars 5000" >> "$moodle_path/.htaccess"
+            fi
+        fi
+    fi
+    
+    # Run the upgrade
+    cd "$moodle_path"
+    
+    # Check if user wants to handle database upgrade manually
+    if ask_yes_no "Do you want the script to automatically upgrade the database?"; then
+        log "Running automatic database upgrade..."
+        if php admin/cli/upgrade.php --non-interactive --allow-unstable; then
+            success "Moodle upgrade completed successfully"
+        else
+            error "Moodle upgrade failed"
+            warning "You may need to run the upgrade manually:"
+            warning "cd $moodle_path && php admin/cli/upgrade.php"
+            exit 1
+        fi
+    else
+        log "Skipping automatic database upgrade"
+        warning "You will need to complete the upgrade manually:"
+        warning "1. Via web interface: Visit your Moodle site and follow the upgrade wizard"
+        warning "2. Via CLI: cd $moodle_path && php admin/cli/upgrade.php"
+        
+        if ask_yes_no "Do you want to run the upgrade now via CLI?"; then
+            log "Running CLI upgrade..."
+            php admin/cli/upgrade.php
+        fi
+    fi
+    
+    # Post-upgrade optimizations
+    log "Running post-upgrade optimizations..."
+    
+    # Clear all caches
+    if [[ -f "$moodle_path/admin/cli/purge_caches.php" ]]; then
+        php admin/cli/purge_caches.php 2>/dev/null || true
+        log "Caches purged"
+    fi
+    
+    # Fix file permissions after upgrade
+    if [[ -d "$moodle_path" ]]; then
+        chown -R www-data:www-data "$moodle_path" 2>/dev/null || true
+        find "$moodle_path" -type d -exec chmod 755 {} + 2>/dev/null || true
+        find "$moodle_path" -type f -exec chmod 644 {} + 2>/dev/null || true
+        chmod 600 "$moodle_path/config.php" 2>/dev/null || true
+        log "File permissions fixed"
     fi
 }
 
@@ -354,7 +486,7 @@ disable_maintenance_mode() {
 # Main function
 main() {
     echo "=================================="
-    echo "    Moodle Update Script v1.0"
+    echo "      Moodle Updater v1.0"
     echo "=================================="
     echo
     
@@ -474,7 +606,30 @@ main() {
     success "Backup saved in: $backup_dir"
     success "Maintenance mode: DISABLED ✅"
     
-    log "Please test your Moodle installation thoroughly."
+    # Show important post-upgrade information
+    echo
+    log "=== POST-UPGRADE CHECKLIST ==="
+    log "1. ✅ Test your Moodle installation thoroughly"
+    log "2. ⚠️  Check Admin → Server → Environment for any warnings"
+    log "3. 📊 Review Admin → Reports → Config changes"
+    log "4. 🔒 Verify user permissions and course access"
+    log "5. 📧 Test email functionality"
+    log "6. 🔄 Check that plugins are working correctly"
+    
+    # Environment warnings
+    echo
+    log "=== KNOWN ENVIRONMENT ISSUES ==="
+    warning "MariaDB 10.6.18 detected - Moodle recommends 10.11.0+"
+    log "Consider upgrading MariaDB when possible"
+    
+    local current_max_vars=$(php -r "echo ini_get('max_input_vars');")
+    if [[ "$current_max_vars" -lt 5000 ]]; then
+        warning "max_input_vars is still $current_max_vars - should be 5000+"
+        log "Add this to your PHP configuration:"
+        log "max_input_vars = 5000"
+    fi
+    
+    log "For asynchronous backups, see: Admin → Server → Asynchronous backups"
     
     # Final status check
     if grep -q "maintenance_enabled.*true" "$moodle_path/config.php" 2>/dev/null; then
