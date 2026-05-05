@@ -1,4 +1,4 @@
-# Moodle Updater v1.0
+# Moodle Updater v1.1
 
 [![GitHub Release](https://img.shields.io/github/v/release/EverHype-Systems/moodle-update)](https://github.com/EverHype-Systems/moodle-update/releases)
 [![License](https://img.shields.io/github/license/EverHype-Systems/moodle-update)](https://github.com/EverHype-Systems/moodle-update/blob/main/LICENSE)
@@ -10,8 +10,11 @@ Automated Moodle update script with comprehensive backup, security checks, and m
 ## Features
 
 - **Automated Updates**: Download and install any Moodle version from GitHub releases
+- **Stable/Dev Resolution**: Stable versions use `vX.Y.Z` tags; unreleased/dev targets require `--allow-unstable`
 - **Smart Backup System**: Automatic backup of code, database, and critical data
 - **PHP Compatibility**: Automatic PHP version checking and upgrade support
+- **Non-interactive Runs**: `--yes` supports unattended runs after pre-flight validation
+- **Public Webroot Handling**: Updates Apache/Nginx roots to Moodle `public/` when needed
 - **Version Validation**: Prevents downgrades and validates target versions
 - **Maintenance Mode**: Automatic maintenance mode during updates
 - **Database Support**: MySQL, MariaDB, and PostgreSQL backup support
@@ -23,7 +26,7 @@ Automated Moodle update script with comprehensive backup, security checks, and m
 
 - **Operating System**: Ubuntu/Debian (preferred), CentOS/RHEL compatible
 - **Privileges**: Root access (sudo) required
-- **PHP**: Version 7.4+ (script can auto-upgrade)
+- **PHP**: Version compatible with the target Moodle release. Moodle 5.2+ requires PHP 8.3+
 - **Database**: MySQL/MariaDB or PostgreSQL
 - **Web Server**: Apache2 or Nginx
 - **Tools**: curl, tar, sed, grep, systemctl
@@ -60,10 +63,30 @@ sha256sum updater.sh
 sudo ./updater.sh /var/www/html/moodle /var/www/moodledata
 
 # Specify target version
-sudo ./updater.sh /var/www/html/moodle /var/www/moodledata 5.0.1
+sudo ./updater.sh /var/www/html/moodle /var/www/moodledata 5.2.0
 
 # Update to latest available version
 sudo ./updater.sh /var/www/html/moodle /var/www/moodledata latest
+
+# Non-interactive run, only when all requirements already pass
+sudo ./updater.sh --yes /var/www/html/moodle /var/www/moodledata latest
+
+# Permit unattended PHP/database package changes as well
+sudo ./updater.sh --yes --allow-system-changes /var/www/html/moodle /var/www/moodledata 5.2.0
+
+# Install an unreleased/dev target such as 5.3dev from main (staging only)
+sudo ./updater.sh --allow-unstable /var/www/html/moodle /var/www/moodledata 5.3
+```
+
+### Options
+
+```bash
+-y, --yes                 Run non-interactively and answer yes to updater prompts
+    --allow-unstable      Allow beta, RC, or dev targets such as 5.3dev
+    --allow-system-changes
+                          Permit unattended PHP/database package upgrades with --yes
+    --skip-webroot-update Do not update Apache/Nginx DocumentRoot to /public
+    --no-restart          Do not restart Apache/Nginx at the end
 ```
 
 ### Examples
@@ -80,7 +103,7 @@ sudo ./updater.sh /opt/moodle /opt/moodledata 4.4.2
 
 **Development/Testing Environment:**
 ```bash
-sudo ./updater.sh /home/user/moodle /home/user/moodledata 5.0.0
+sudo ./updater.sh --allow-unstable /home/user/moodle /home/user/moodledata 5.3
 ```
 
 ## Directory Structure
@@ -147,6 +170,20 @@ curl -I https://github.com
 
 # Verify GitHub access
 curl -s https://api.github.com/repos/moodle/moodle/tags | head
+```
+
+**Moodle 5.3 Is Not Listed As Stable:**
+```bash
+# Moodle 5.3 is currently resolved from the main branch as 5.3dev.
+# Use this only in staging/testing:
+sudo ./updater.sh --allow-unstable /var/www/html/moodle /var/www/moodledata 5.3
+```
+
+**Moodle 5.1+ Shows The Wrong Web Directory:**
+```bash
+# Moodle now ships a public/ webroot. The updater attempts to update Apache/Nginx.
+# If skipped or not detected, set your site root manually to:
+/var/www/html/moodle/public
 ```
 
 **Database Backup Issues:**
@@ -310,7 +347,15 @@ This script is provided as-is for educational and operational purposes. Use at y
 
 ## Changelog
 
-### v1.0 (Current)
+### v1.1 (Current)
+- Fixed Moodle 5.1+ `public/` webroot handling
+- Added explicit stable/dev target resolution for versions such as 5.3dev
+- Fixed database backup config parsing by defining `CLI_SCRIPT`
+- Fixed polluted backup path output during command substitution
+- Updated PHP requirements for Moodle 5.2+
+- Added `--yes`, `--allow-unstable`, `--allow-system-changes`, and restart/webroot controls
+
+### v1.0
 - Initial release
 - Automated Moodle updates with backup
 - PHP compatibility checking
