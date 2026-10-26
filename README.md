@@ -1,371 +1,229 @@
-# Moodle Updater v1.1
+# Moodle Updater v2.0
 
-[![GitHub Release](https://img.shields.io/github/v/release/EverHype-Systems/moodle-update)](https://github.com/EverHype-Systems/moodle-update/releases)
-[![License](https://img.shields.io/github/license/EverHype-Systems/moodle-update)](https://github.com/EverHype-Systems/moodle-update/blob/main/LICENSE)
-[![GitHub Issues](https://img.shields.io/github/issues/EverHype-Systems/moodle-update)](https://github.com/EverHype-Systems/moodle-update/issues)
-[![GitHub Stars](https://img.shields.io/github/stars/EverHype-Systems/moodle-update)](https://github.com/EverHype-Systems/moodle-update/stargazers)
-
-Automated Moodle update script with comprehensive backup, security checks, and maintenance mode handling.
-
-## Features
-
-- **Automated Updates**: Download and install any Moodle version from GitHub releases
-- **Stable/Dev Resolution**: Stable versions use `vX.Y.Z` tags; unreleased/dev targets require `--allow-unstable`
-- **Smart Backup System**: Automatic backup of code, database, and critical data
-- **PHP Compatibility**: Automatic PHP version checking and upgrade support
-- **Non-interactive Runs**: `--yes` supports unattended runs after pre-flight validation
-- **Public Webroot Handling**: Updates Apache/Nginx roots to Moodle `public/` when needed
-- **Version Validation**: Prevents downgrades and validates target versions
-- **Maintenance Mode**: Automatic maintenance mode during updates
-- **Database Support**: MySQL, MariaDB, and PostgreSQL backup support
-- **Security Focused**: Proper permissions and security hardening
-- **Progress Tracking**: Real-time progress with colored output
-- **Web Server Integration**: Automatic web server restart after updates
+A standalone Bash updater for existing Moodle installations. Downloaded Moodle
+code is prepared and checked before maintenance starts. The updater preserves
+contributed plugins, creates mandatory backups, swaps the code directory, runs
+Moodle's own database upgrader as the web user, and restarts web/PHP workers.
 
 ## Requirements
 
-- **Operating System**: Ubuntu/Debian (preferred), CentOS/RHEL compatible
-- **Privileges**: Root access (sudo) required
-- **PHP**: Version compatible with the target Moodle release. Moodle 5.2+ requires PHP 8.3+
-- **Database**: MySQL/MariaDB or PostgreSQL
-- **Web Server**: Apache2 or Nginx
-- **Tools**: curl, tar, sed, grep, systemctl
+- Linux, Bash **4.4+**, root, PHP **8.1+** with SimpleXML, and a working Moodle installation.
+- `curl`, GNU `tar`, `find`, `cp`, `mv`, `du`, `df`, `stat`, `mktemp`, `runuser`,
+  `systemctl`, and `crontab` unless `--cron-paused` is supplied.
+- One active Apache (`apache2`/`httpd`) or Nginx service.
+- `mysqldump` for MariaDB/MySQL, or `pg_dump` and `pg_restore` for PostgreSQL.
+- The application's database user must be allowed to create a complete dump,
+  including routines/triggers. A failed dump is fatal; a schema-only dump never
+  counts as a backup.
+- Separate, non-nested code and moodledata directories. The code directory must
+  be a real directory on the same filesystem as its parent, not a deployment
+  symlink or separate mount point.
 
-## Installation
+The target release's `admin/environment.xml` supplies the PHP, extension,
+intermediate-upgrade and database minimums. The **connected database server** is
+checked, rather than the installed command-line client's version. For example,
+Moodle 5.2 accepts MariaDB 10.11, while Moodle 5.3 requires MariaDB 11.4.
+Moodle's own upgrader performs its full environment/plugin checks too.
 
-### Quick Install
+PHP and database **package upgrades are separate operations**. The updater no
+longer modifies package repositories, installs packages, or upgrades a database
+server. The old `--allow-system-changes` flag exits with a migration message.
+
+## Download and inspect
+
 ```bash
-# Download directly from GitHub
-curl -o updater.sh https://raw.githubusercontent.com/EverHype-Systems/moodle-update/main/updater.sh
-chmod +x updater.sh
+curl --fail --location \
+  https://raw.githubusercontent.com/EverHype-Systems/moodle-update/main/updater.sh \
+  -o updater.sh
+bash -n updater.sh
+bash updater.sh --help
 ```
 
-### Clone Repository
-```bash
-# Clone the repository
-git clone https://github.com/EverHype-Systems/moodle-update.git
-cd moodle-update
-chmod +x updater.sh
-```
-
-### Verify Download
-```bash
-# Check script integrity
-sha256sum updater.sh
-# Compare with hash from GitHub releases
-```
+The script embeds its PHP helper; no repository checkout, Python, Composer,
+`jq`, or extra helper download is required at runtime. Use a pinned Git commit
+instead of `main` when reproducing an approved deployment.
 
 ## Usage
 
-### Basic Usage
+Always rehearse major upgrades on an isolated copy of code, database and data.
+Disable outbound mail and integrations on that copy. `--dry-run` validates a
+plan; it does **not** execute a test database migration or prove plugin runtime
+compatibility.
+
 ```bash
-# Interactive mode - will prompt for version
-sudo ./updater.sh /var/www/html/moodle /var/www/moodledata
+# Resolve a minor to its newest stable tag and inspect prerequisites.
+sudo bash updater.sh --dry-run /var/www/moodle/moodle /var/www/moodle/moodledata 5.2
 
-# Specify target version
-sudo ./updater.sh /var/www/html/moodle /var/www/moodledata 5.2.0
+# Run the exact reviewed release with a complete independent local backup.
+sudo bash updater.sh --yes \
+  --backup-dir /mnt/backup/moodle \
+  /var/www/moodle/moodle /var/www/moodle/moodledata 5.2.4
 
-# Update to latest available version
-sudo ./updater.sh /var/www/html/moodle /var/www/moodledata latest
+# Explicit alternative for large immutable content stores on the same filesystem.
+sudo bash updater.sh --yes --backup-mode hardlink \
+  /var/www/moodle/moodle /var/www/moodle/moodledata 5.2.4
 
-# Non-interactive run, only when all requirements already pass
-sudo ./updater.sh --yes /var/www/html/moodle /var/www/moodledata latest
-
-# Permit unattended PHP/database package changes as well
-sudo ./updater.sh --yes --allow-system-changes /var/www/html/moodle /var/www/moodledata 5.2.0
-
-# Install an unreleased/dev target such as 5.3dev from main (staging only)
-sudo ./updater.sh --allow-unstable /var/www/html/moodle /var/www/moodledata 5.3
+# Development only: an explicit branch requires an explicit opt-in.
+sudo bash updater.sh --allow-unstable /srv/staging/moodle /srv/staging/data main
 ```
+
+`latest` selects the newest stable `vX.Y.Z` tag; it does not select the newest
+version compatible with the existing server. If that release needs a newer
+runtime/database, preflight stops. Select a supported release explicitly or
+upgrade the server separately. Exact missing patch versions never silently
+fall back to a stable/development branch. Prerelease tags and explicit branches
+always require `--allow-unstable`; downloaded maturity and build numbers are
+checked again, including same-minor build downgrades.
 
 ### Options
 
+| Option | Behavior |
+| --- | --- |
+| `--yes`, `-y` | Skip the confirmation prompt; retain every safety check. |
+| `--dry-run` | Download, stage and validate; do not swap code, migrate the DB, pause cron, enter maintenance, or change web configuration. Temporary files are removed. Moodle bootstrap may populate its caches; an external backup parent may be created for a capacity check. |
+| `--backup-dir DIR` | Persistent backup parent, default `/var/backups/moodle`. Must be outside code and moodledata, and must not contain either directory. Each run gets a private unique subdirectory. |
+| `--backup-mode copy` | Default: copy all local moodledata, including `filedir`. |
+| `--backup-mode hardlink` | Hardlink only immutable content in `filedir`; copy the rest. Requires the same filesystem. This protects against deletion during an update, **not disk failure or in-place modifications**. Keep an independent/off-server backup too. |
+| `--web-user USER` | PHP service account; defaults to the owner of `config.php`. If root owns the file, a non-root account with the same name as its service group is inferred; otherwise pass `--web-user`. Root is not accepted as the Moodle execution user. |
+| `--fpm-service UNIT` | Repeatable site-specific PHP-FPM unit, e.g. `php8.3-fpm.service`. Defaults to an active service matching CLI PHP (or the generic `php-fpm.service`). Required for Nginx if no default can be detected; specify it for custom pools or when web PHP differs from CLI PHP. Unrelated FPM versions are not restarted. |
+| `--preserve-path PATH` | Repeatable extra non-core path, relative to the old Moodle webroot. Refuses traversal, symlinks and collisions with new core code. |
+| `--cron-paused` | Acknowledge that external/system cron and timers are already paused by the operator. Active workers are still checked. |
+| `--allow-unstable` | Allow a prerelease tag or an explicit development branch such as `main`. |
+| `--skip-webroot-update` | Leave web configuration to the operator. It must point at `public/` when the target uses it. |
+| `--no-restart` | Finish migration but leave CLI maintenance and cron paused. Exit **2** with recovery paths. Restart workers and finish verification manually before reopening. |
+
+Set `PHP_BIN=/absolute/path/to/php` to use a specific PHP interpreter.
+
+### Plugins and customizations
+
+Contributed plugins are discovered through Moodle's plugin manager, including
+nested subplugins. Their code is copied to the corresponding path in the new
+webroot. Declared Moodle minimums and supported branch ranges are checked;
+Moodle subsequently checks all plugin dependencies before migration. Plugins
+are retained at their current version, **not automatically downloaded or
+upgraded**. Undeclared compatibility still needs a staging test.
+
+Already missing plugins are reported; they are not uninstalled and their data
+is not deleted. Preserved paths cannot overwrite target core components.
+Symlinked/out-of-tree plugins require an operator-led deployment. Git/SVN/Hg
+metadata is excluded from preserved plugin trees. Uncommitted tracked core
+changes cause preflight to stop. Untracked custom root files and modifications
+in non-Git deployments cannot be inferred reliably: review and port them before
+upgrading; use `--preserve-path` for additional non-core files. A Git checkout is
+replaced by release-archive code; its original Git history remains in the backup.
+
+## Operational sequence
+
+1. Acquire a per-code-directory lock and create private working directories.
+2. Read the running site's metadata as its web user. Validate paths and the
+   selected active web service.
+3. Check staging capacity, resolve a release tag, download once, reject unsafe archive paths/links, and
+   extract a staged tree on the code filesystem.
+4. Read target requirements; prevent downgrades; preserve contributed plugins,
+   extra paths, and configuration. Prepare the `public/` bootstrap when needed.
+5. Check backup capacity with headroom and verify backup tooling/cron sources.
+   Confirm the reviewed plan unless `--yes` is set.
+6. Pause matching Moodle entries in root/web-user crontabs. Other cron entries
+   continue running. Enter CLI maintenance and wait up to 120 seconds for
+   existing workers. An idle sleeping worker is terminated only when Moodle
+   reports no active scheduled/ad-hoc tasks. A busy worker is never killed.
+7. Copy code and all local moodledata, then dump the database. Record metadata,
+   dump SHA-256, paths and saved crontabs. Write `BACKUP_COMPLETE` only after
+   every backup operation succeeds.
+8. Swap the code directories using renames on the same filesystem. The old tree
+   is retained until the update succeeds. Code is owned by root, readable by
+   the service group; `config.php` is `0640`. Source executable bits are retained.
+9. Back up and update **exact** Apache/Nginx root directives. Already-correct
+   `/public` roots stay unchanged, as do neighboring paths such as `moodle2`.
+   Validate server configuration before proceeding.
+10. Run Moodle's upgrader and cache purge as the web user with
+    `max_input_vars=5000` for CLI commands. Verify no upgrade is pending and the
+    installed DB build matches the downloaded code. Persistent PHP settings are
+    not rewritten; web PHP must already meet Moodle's requirements.
+11. Restart the detected web service and selected PHP-FPM services; check their
+    service state. Restore the original CLI-maintenance state and cron entries.
+    Remove temporary staging state only after success. Retain the backup,
+    `before.json`, `after.json`, `upgrade.log`, and `UPDATE_COMPLETE`.
+
+Crontabs in `/etc/crontab` or `/etc/cron.d` that explicitly invoke this Moodle
+path are detected and require external pausing plus `--cron-paused`. Systemd
+timers, relative/wrapper invocations, containers and remote schedulers cannot
+be reliably discovered. Operators using those mechanisms must pause them too.
+The local directory lock protects against this updater running twice, not other
+deployment tools. Source archive downloads use HTTPS; the recorded dump hash
+checks the backup file, not publisher authentication of the release archive.
+
+## Failure and recovery
+
+The script never prints a success message after a failed dump, migration, cache
+purge, service restart, or maintenance cleanup. Database passwords are read with
+`CLI_SCRIPT` defined and put in mode-0600 connection files, not command arguments
+or progress logs. Connection files are removed on normal exits and handled
+signals. Do not run under `bash -x`, which would expose private operational data.
+
+**Before migration starts:** an incomplete backup stops the operation before
+code replacement. If installation or web configuration fails after the rename,
+the updater restores the original code/configuration and previous maintenance/
+cron state. If recovery itself fails, it retains diagnostic state and reports it.
+
+**After migration may have started:** no automatic rollback is attempted.
+A migration may have committed schema/data changes. New code, CLI maintenance
+and paused cron remain in place. The private working directory and backup paths
+are printed so the operator can repair the upgrade or restore a consistent set.
+The same controlled handoff applies to `--no-restart` (exit 2).
+
+Recovery requires operator review:
+
+1. Keep the site in CLI maintenance and all of its schedulers paused.
+2. Verify `BACKUP_COMPLETE`, the dump hash, and the recorded paths in `paths.txt`.
+3. Either repair and rerun Moodle's CLI upgrader, or restore **code, database and
+   moodledata from the same backup**. Do not overlay old code onto new code: remove
+   the failed tree from service first so obsolete/new files cannot remain mixed.
+   Import MariaDB/MySQL `database.sql` with an authorized client; restore the
+   PostgreSQL custom-format `database.dump` with `pg_restore` into a clean DB.
+4. Restore changed web-server files from `webserver/etc/...`, validate the
+   configuration, restart the relevant web/PHP services and verify the site.
+5. If the site was originally online, run Moodle's `admin/cli/maintenance.php
+   --disable` as its web user. The moodledata snapshot includes the maintenance
+   file created for backup consistency; it must not accidentally leave a
+   restored site blocked. Preserve maintenance if it was already active before
+   the update (`initial_cli_maintenance=true` in `paths.txt`).
+6. Restore saved crontabs, merging any unrelated edits made since the backup.
+   Keep backups until the update and application-level checks are accepted.
+
+Locks are removed after handled failures. SIGKILL/power loss can leave a stale
+`.moodle-updater-<directory>.lock` next to the code. Verify there is no active
+update and inspect private working state before removing that lock or retrying.
+No unattended updater can guarantee recovery after disk failure or SIGKILL.
+
+## Verification and development
+
 ```bash
--y, --yes                 Run non-interactively and answer yes to updater prompts
-    --allow-unstable      Allow beta, RC, or dev targets such as 5.3dev
-    --allow-system-changes
-                          Permit unattended PHP/database package upgrades with --yes
-    --skip-webroot-update Do not update Apache/Nginx DocumentRoot to /public
-    --no-restart          Do not restart Apache/Nginx at the end
+bash -n updater.sh
+bash updater.sh --help
+shellcheck updater.sh
+python3 tests/test_updater.py
 ```
 
-### Examples
+Tests are offline and use temporary fixtures. They cover stable/dev resolution,
+missing patch rejection, requirement gates, plugin preservation, exact/idempotent
+webroot changes, archive validation, secret handling, cron merging, backup/disk
+failures, and recovery before/after the database-migration boundary.
+CI runs them on Ubuntu 22.04 and 24.04. Real upgrades must additionally be
+rehearsed against an isolated database/site copy. A successful CLI update and
+service restart do not replace application checks for login, course access,
+uploads, plugins and mail; the updater does not send test mail or impersonate users.
 
-**Standard Moodle Installation:**
-```bash
-sudo ./updater.sh /var/www/html/moodle /var/www/moodledata
-```
+## Changes from v1.1
 
-**Custom Paths:**
-```bash
-sudo ./updater.sh /opt/moodle /opt/moodledata 4.4.2
-```
-
-**Development/Testing Environment:**
-```bash
-sudo ./updater.sh --allow-unstable /home/user/moodle /home/user/moodledata 5.3
-```
-
-## Directory Structure
-
-The script expects the following structure:
-```
-/var/www/html/moodle/          # Moodle code directory
-├── admin/                     # Moodle admin directory
-├── config.php                 # Moodle configuration
-├── version.php                # Version information
-└── ...                        # Other Moodle files
-
-/var/www/moodledata/           # Moodle data directory
-├── cache/                     # Cache files
-├── sessions/                  # Session data
-├── temp/                      # Temporary files
-└── ...                        # Other data files
-```
-
-## Security Features
-
-### Backup System
-- **Automatic Backups**: Created before any changes
-- **Multiple Backup Types**: Code, database, and configuration
-- **Timestamp Naming**: Easy identification of backup versions
-- **Safe Location**: Stored in `/tmp/moodle_backup_YYYYMMDD_HHMMSS/`
-
-### Permission Management
-- **Secure Defaults**: Proper file and directory permissions
-- **Web Server User**: Automatic detection of web server user (www-data, apache, nginx)
-- **Config Protection**: Secured config.php with restricted access
-- **Maintenance Mode**: Automatic activation during updates
-
-### Version Validation
-- **Downgrade Prevention**: Blocks dangerous downgrades
-- **PHP Compatibility**: Validates PHP version requirements
-- **Version Comparison**: Intelligent semantic version comparison
-
-## Troubleshooting
-
-### Common Issues
-
-**Permission Denied:**
-```bash
-# Ensure script has execute permissions
-chmod +x updater.sh
-
-# Run with sudo
-sudo ./updater.sh [paths]
-```
-
-**PHP Version Too Old:**
-```bash
-# Script will prompt to auto-upgrade PHP
-# Or manually upgrade PHP first:
-sudo apt-get update
-sudo apt-get install php8.3
-```
-
-**Download Failures:**
-```bash
-# Check internet connection
-curl -I https://github.com
-
-# Verify GitHub access
-curl -s https://api.github.com/repos/moodle/moodle/tags | head
-```
-
-**Moodle 5.3 Is Not Listed As Stable:**
-```bash
-# Moodle 5.3 is currently resolved from the main branch as 5.3dev.
-# Use this only in staging/testing:
-sudo ./updater.sh --allow-unstable /var/www/html/moodle /var/www/moodledata 5.3
-```
-
-**Moodle 5.1+ Shows The Wrong Web Directory:**
-```bash
-# Moodle now ships a public/ webroot. The updater attempts to update Apache/Nginx.
-# If skipped or not detected, set your site root manually to:
-/var/www/html/moodle/public
-```
-
-**Database Backup Issues:**
-```bash
-# Ensure database tools are installed
-sudo apt-get install mysql-client    # For MySQL/MariaDB
-sudo apt-get install postgresql-client  # For PostgreSQL
-
-# Verify database credentials in config.php
-```
-
-### Debug Mode
-
-The script automatically enables debug mode during updates. To manually enable:
-
-```php
-// In config.php
-$CFG->debug = 32767;
-$CFG->debugdisplay = 1;
-```
-
-### Log Files
-
-Check these locations for detailed error information:
-- Web server logs: `/var/log/apache2/error.log` or `/var/log/nginx/error.log`
-- PHP logs: `/var/log/php/error.log`
-- Moodle logs: Via Admin → Reports → Logs in Moodle interface
-
-## Update Process Flow
-
-1. **Pre-flight Checks**
-   - Validate paths and permissions
-   - Check current Moodle version
-   - Verify PHP compatibility
-   - Fetch available versions
-
-2. **Backup Phase**
-   - Create timestamped backup directory
-   - Backup Moodle code
-   - Backup database
-   - Backup configuration files
-
-3. **Maintenance Mode**
-   - Enable maintenance mode
-   - Display maintenance message to users
-
-4. **Update Phase**
-   - Download target Moodle version
-   - Extract and install new files
-   - Preserve existing configuration
-   - Set proper permissions
-
-5. **Upgrade Process**
-   - Run Moodle CLI upgrade script
-   - Update database schema
-   - Clear caches
-
-6. **Finalization**
-   - Disable maintenance mode
-   - Restart web server
-   - Verify installation
-   - Display success status
-
-## Recovery Process
-
-If an update fails, recovery steps:
-
-1. **Automatic Recovery:**
-   ```bash
-   # Restore from automatic backup
-   BACKUP_DIR="/tmp/moodle_backup_YYYYMMDD_HHMMSS"
-   sudo cp -r $BACKUP_DIR/moodle_code/* /var/www/html/moodle/
-   sudo cp $BACKUP_DIR/config.php.backup /var/www/html/moodle/config.php
-   ```
-
-2. **Database Recovery:**
-   ```bash
-   # Restore database from backup
-   mysql -u username -p database_name < $BACKUP_DIR/database_backup.sql
-   ```
-
-3. **Manual Maintenance Mode Disable:**
-   ```bash
-   # If maintenance mode is stuck
-   sudo sed -i '/maintenance_enabled.*true/d' /var/www/html/moodle/config.php
-   ```
-
-## Advanced Configuration
-
-### Custom PHP Paths
-```bash
-# If PHP is in non-standard location
-export PATH="/opt/php8.3/bin:$PATH"
-./updater.sh [paths]
-```
-
-### Custom Web Server User
-```bash
-# The script auto-detects, but you can modify the script:
-# Edit line: WEB_USER="${3:-www-data}"
-# Change www-data to your web server user
-```
-
-### Firewall Considerations
-```bash
-# Ensure outbound HTTPS is allowed
-sudo ufw allow out 443
-sudo ufw allow out 80
-```
-
-## Support
-
-### Before Seeking Help
-
-1. **Check Requirements**: Ensure all prerequisites are met
-2. **Review Logs**: Check web server and PHP error logs
-3. **Test Manually**: Verify Moodle works after update
-4. **Backup Status**: Confirm backups were created successfully
-
-### Getting Help
-
-- **GitHub Issues**: [Report bugs or request features](https://github.com/EverHype-Systems/moodle-update/issues)
-- **GitHub Discussions**: [Community support and questions](https://github.com/EverHype-Systems/moodle-update/discussions)
-- **Moodle Community**: [moodle.org/support](https://moodle.org/support)
-- **Documentation**: [docs.moodle.org](https://docs.moodle.org)
-
-### Contributing
-
-We welcome contributions! Please see our [Contributing Guidelines](https://github.com/EverHype-Systems/moodle-update/blob/main/CONTRIBUTING.md).
-
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Add tests if applicable
-5. Submit a pull request
-
-### Reporting Issues
-
-When [reporting issues](https://github.com/EverHype-Systems/moodle-update/issues/new), include:
-- Operating system and version
-- Current Moodle version
-- Target Moodle version
-- PHP version
-- Error messages
-- Relevant log excerpts
-
-## Security Notice
-
-**Important Security Considerations:**
-
-- Always test updates in a staging environment first
-- Ensure you have complete system backups before major updates
-- Review Moodle security announcements before updating
-- Keep PHP and web server software updated
-- Monitor file permissions after updates
-- Verify database integrity after updates
-
-## License
-
-This script is provided as-is for educational and operational purposes. Use at your own risk and always maintain proper backups.
-
-## Changelog
-
-### v1.1 (Current)
-- Fixed Moodle 5.1+ `public/` webroot handling
-- Added explicit stable/dev target resolution for versions such as 5.3dev
-- Fixed database backup config parsing by defining `CLI_SCRIPT`
-- Fixed polluted backup path output during command substitution
-- Updated PHP requirements for Moodle 5.2+
-- Added `--yes`, `--allow-unstable`, `--allow-system-changes`, and restart/webroot controls
-
-### v1.0
-- Initial release
-- Automated Moodle updates with backup
-- PHP compatibility checking
-- Database backup support
-- Maintenance mode handling
-- Multi-platform support
-- Comprehensive error handling
-
----
-
-**Happy Updating!**
-
-For the latest version and updates, visit: https://github.com/EverHype-Systems/moodle-update
+- Fail closed on incomplete backups; full local moodledata coverage and capacity
+  checks; persistent backups with explicit copy/hardlink semantics.
+- Prepare downloads before downtime; preserve plugins and explicit extra paths.
+- Read actual target/server requirements, including changed MariaDB minimums.
+- Replace unsafe package/repository upgrades with explicit prerequisite failures.
+- Protect concurrent runs; pause cron; preserve pre-existing maintenance state;
+  distinguish pre-migration rollback from post-migration recovery.
+- Fix `/public/public` rewrites; validate/restart workers before reopening.
+- Run Moodle as its service user and keep code/configuration permissions narrow.
+- Add offline regression tests and CI. No claim of automatic plugin compatibility
+  checking or database recovery beyond the checks described above.

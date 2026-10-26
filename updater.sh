@@ -1,1387 +1,729 @@
-#!/bin/bash
-
-# Moodle Updater v1.1
-# Automated Moodle update script with security checks and backup functionality
-
-set -euo pipefail
-
-# Colors for output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+#!/usr/bin/env bash
+# Moodle Updater v2.0. Single-file deployment; PHP is already required by Moodle.
+# PHP snippets deliberately prevent shell expansion of PHP's $variables.
+# shellcheck disable=SC2016
+set -Eeuo pipefail
+umask 077
 
 ASSUME_YES=false
 ALLOW_UNSTABLE=false
-ALLOW_SYSTEM_CHANGES=false
 SKIP_WEBROOT_UPDATE=false
 SKIP_RESTART=false
+DRY_RUN=false
+CRON_PAUSED=false
+BACKUP_MODE=copy
+BACKUP_ROOT=/var/backups/moodle
+WEB_USER=
+PHP_BIN=${PHP_BIN:-php}
+PRESERVE_PATHS=()
+FPM_SERVICES=()
+POSITIONAL_ARGS=()
+WORK_DIR=
+STAGE_DIR=
+BACKUP_DIR=
+LOCK_DIR=
+DB_AUTH_FILE=
+MOODLE_PATH=
+DATA_PATH=
+OLD_CODE=
+PHASE=preflight
+CODE_SWAPPED=false
+OLD_MOVED=false
+MAINTENANCE_CHANGED=false
+SUCCESS=false
+WEB_CHANGED=false
+WEB_SERVICE=
+INITIAL_CLI_MAINTENANCE=false
+CRON_SAVED=()
 
-TARGET_DOWNLOAD_URL=""
-TARGET_REF_LABEL=""
-TARGET_IS_UNSTABLE=false
-TARGET_VERSION_FOR_COMPARE=""
-RESOLVED_TARGET_VERSION=""
-
-# Logging functions
-log() {
-    echo -e "${BLUE}[$(date '+%Y-%m-%d %H:%M:%S')]${NC} $1"
-}
-
-error() {
-    echo -e "${RED}[ERROR]${NC} $1" >&2
-}
-
-success() {
-    echo -e "${GREEN}[SUCCESS]${NC} $1"
-}
-
-warning() {
-    echo -e "${YELLOW}[WARNING]${NC} $1"
-}
-
-# Helper function for user queries
-ask_yes_no() {
-    if [[ "$ASSUME_YES" == "true" ]]; then
-        echo "$1 (y/n): y"
-        return 0
-    fi
-
-    while true; do
-        read -p "$1 (y/n): " yn
-        case $yn in
-            [Yy]* ) return 0;;
-            [Nn]* ) return 1;;
-            * ) echo "Please answer with y or n.";;
-        esac
-    done
-}
-
+log() { printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >&2; }
+error() { log "ERROR: $*"; }
+die() { error "$*"; exit 1; }
 usage() {
-    cat << EOF
-Usage: $0 [options] <moodle_path> <moodledata_path> [target_version]
+    cat <<'HELP'
+Moodle Updater v2.0
+Usage: bash updater.sh [options] <moodle_code> <moodledata> [version|latest]
+
+  -y, --yes                 Do not prompt (all checks still apply)
+      --dry-run             Download and validate; do not change the installation
+      --backup-dir DIR      Persistent backup parent (default /var/backups/moodle)
+      --backup-mode MODE    copy (default) or hardlink (immutable filedir only)
+      --web-user USER       PHP/web server user (default: config.php owner)
+      --fpm-service UNIT    PHP-FPM service used by this site; repeat if needed
+                            (default: running service matching CLI PHP version)
+      --preserve-path PATH  Preserve an extra non-core path relative to the old
+                            Moodle webroot; repeat for multiple paths
+      --cron-paused         Cron is already paused externally (systemd/cron.d/etc.)
+      --allow-unstable      Explicitly allow prerelease tags or development branches
+      --skip-webroot-update Keep web server configuration; verify it manually
+      --no-restart          Keep CLI maintenance and cron paused after migration;
+                            operator must restart web/PHP workers before reopening
+  -h, --help                Show this help
 
 Examples:
-  $0 /var/www/html/moodle /var/www/moodledata 5.2.0
-  $0 --yes /var/www/html/moodle /var/www/moodledata latest
-  $0 --allow-unstable /var/www/html/moodle /var/www/moodledata 5.3
+  sudo bash updater.sh --dry-run /var/www/moodle /var/lib/moodledata 5.2
+  sudo bash updater.sh --yes /var/www/moodle /var/lib/moodledata 5.2.4
 
-Options:
-  -y, --yes                 Run non-interactively and answer yes to updater prompts
-      --allow-unstable      Allow beta/RC/dev targets. 5.3 currently maps to main/5.3dev
-      --allow-system-changes
-                            Permit unattended PHP/database package upgrades with --yes
-      --skip-webroot-update Do not update Apache/Nginx DocumentRoot to /public
-      --no-restart          Do not restart Apache/Nginx at the end
-  -h, --help                Show this help
-EOF
+PHP/database package upgrades are deliberately separate from this tool.
+Hardlink backups protect against update-time deletion, not disk failure or
+in-place changes. Backups are not automatically deleted.
+HELP
 }
-
 parse_args() {
-    POSITIONAL_ARGS=()
-
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            -y|--yes|--non-interactive)
-                ASSUME_YES=true
-                shift
-                ;;
-            --allow-unstable|--allow-dev)
-                ALLOW_UNSTABLE=true
-                shift
-                ;;
+            -h|--help) usage; exit 0 ;;
+            -y|--yes|--non-interactive) ASSUME_YES=true; shift ;;
+            --dry-run) DRY_RUN=true; shift ;;
+            --allow-unstable|--allow-dev) ALLOW_UNSTABLE=true; shift ;;
+            --skip-webroot-update) SKIP_WEBROOT_UPDATE=true; shift ;;
+            --no-restart) SKIP_RESTART=true; shift ;;
+            --cron-paused) CRON_PAUSED=true; shift ;;
+            --backup-dir|--backup-mode|--web-user|--preserve-path|--fpm-service)
+                [[ $# -ge 2 && -n "$2" && "$2" != -* ]] || die "Missing value for $1"
+                case "$1" in
+                    --backup-dir) BACKUP_ROOT=$2 ;;
+                    --backup-mode) BACKUP_MODE=$2 ;;
+                    --web-user) WEB_USER=$2 ;;
+                    --preserve-path) PRESERVE_PATHS+=("$2") ;;
+                    --fpm-service)
+                        [[ "$2" =~ ^[a-zA-Z0-9@_.:-]+\.service$ && "$2" != -* ]] || die "Invalid FPM service name"
+                        FPM_SERVICES+=("$2") ;;
+                esac
+                shift 2 ;;
             --allow-system-changes)
-                ALLOW_SYSTEM_CHANGES=true
-                shift
-                ;;
-            --skip-webroot-update)
-                SKIP_WEBROOT_UPDATE=true
-                shift
-                ;;
-            --no-restart)
-                SKIP_RESTART=true
-                shift
-                ;;
-            -h|--help)
-                usage
-                exit 0
-                ;;
-            --)
-                shift
-                while [[ $# -gt 0 ]]; do
-                    POSITIONAL_ARGS+=("$1")
-                    shift
-                done
-                ;;
-            -*)
-                error "Unknown option: $1"
-                usage
-                exit 1
-                ;;
-            *)
-                POSITIONAL_ARGS+=("$1")
-                shift
-                ;;
+                die "--allow-system-changes was removed. Upgrade PHP/database packages separately, then rerun --dry-run." ;;
+            --) shift; POSITIONAL_ARGS+=("$@"); break ;;
+            -*) die "Unknown option: $1" ;;
+            *) POSITIONAL_ARGS+=("$1"); shift ;;
         esac
     done
+    [[ "$BACKUP_MODE" == copy || "$BACKUP_MODE" == hardlink ]] || die "Invalid backup mode: $BACKUP_MODE"
+}
+ask_yes_no() {
+    [[ "$ASSUME_YES" == true ]] && return 0
+    local answer
+    read -r -p "$1 [y/N]: " answer || return 1
+    [[ "$answer" == y || "$answer" == Y || "$answer" == yes ]]
+}
+require_command() { command -v "$1" >/dev/null 2>&1 || die "Required command missing: $1"; }
+php_helper() { "$PHP_BIN" "$WORK_DIR/helper.php" "$@"; }
+as_web() { runuser -u "$WEB_USER" -- "$PHP_BIN" -d max_input_vars=5000 "$@"; }
+json_value() { "$PHP_BIN" -r '$v=json_decode(file_get_contents($argv[1]),true,512,JSON_THROW_ON_ERROR); foreach(explode(".",$argv[2]) as $k){$v=$v[$k]??null;} if(is_bool($v))echo $v?"true":"false";elseif(is_scalar($v))echo $v;elseif($v!==null)echo json_encode($v);' "$1" "$2"; }
+
+# The embedded helper keeps the downloaded updater self-contained. All credentials
+# stay in private files; neither shell arguments nor progress logs contain them.
+write_helper() {
+    cat > "$WORK_DIR/helper.php" <<'PHP'
+<?php
+declare(strict_types=1);
+function fail(string $s): never {fwrite(STDERR,"ERROR: $s\n"); exit(1);}
+function inside(string $p,string $root): bool {return $p===$root || str_starts_with($p,$root.'/');}
+function versionfile(string $root): string {return is_file("$root/public/version.php")?"$root/public/version.php":"$root/version.php";}
+function metadata(string $file,bool $plugin=false): array {
+    if(!defined('MOODLE_INTERNAL'))define('MOODLE_INTERNAL',true);
+    foreach(['MATURITY_ALPHA'=>50,'MATURITY_BETA'=>100,'MATURITY_RC'=>150,'MATURITY_STABLE'=>200,'ANY_VERSION'=>'any'] as $k=>$v){if(!defined($k))define($k,$v);}
+    return (static function() use($file,$plugin){
+        $version=$release=$branch=$maturity=null; $p=new stdClass(); $pvar=&$p;
+        if($plugin){$plugin=$pvar; include $file; return (array)$plugin;}
+        include $file; return compact('version','release','branch','maturity');
+    })();
+}
+function cfg(string $code): void {
+    global $CFG,$DB;
+    if(!defined('CLI_SCRIPT'))define('CLI_SCRIPT',true);
+    require "$code/config.php";
+}
+function validpath(string $rel): bool {return $rel!=='' && $rel[0]!=='/' && !preg_match('~(^|/)(\.\.?)(/|$)|[\x00-\x1f]~',$rel);}
+function copytree(string $src,string $dst): void {
+    if(is_link($src))fail("Symlinks in preserved paths require manual review: $src");
+    if(is_dir($src)){
+        if(!is_dir($dst)&&!mkdir($dst,0755,true))fail("Cannot create $dst");
+        foreach(new DirectoryIterator($src) as $f){if(!$f->isDot()&&!in_array($f->getFilename(),['.git','.svn','.hg'],true))copytree($f->getPathname(),$dst.'/'.$f->getFilename());}
+    }else{
+        if(!is_dir(dirname($dst))&&!mkdir(dirname($dst),0755,true))fail('Cannot create parent');
+        if(!copy($src,$dst))fail("Cannot copy $src");
+        chmod($dst,fileperms($src)&0777);
+    }
+}
+function resolve_target(array $tags,string $requested,bool $allow,array $branches): array {
+    $stable=array_values(array_filter($tags,fn($t)=>preg_match('/^v\d+\.\d+\.\d+$/',$t)));
+    usort($stable,fn($a,$b)=>version_compare(substr($b,1),substr($a,1)));
+    if($requested==='latest')$requested=isset($stable[0])?substr($stable[0],1):'';
+    if(preg_match('/^\d+\.\d+$/',$requested)){
+        foreach($stable as $tag){if(str_starts_with($tag,'v'.$requested.'.')){$requested=substr($tag,1); break;}}
+    }
+    if(in_array('v'.$requested,$tags,true)){
+        $unstable=!preg_match('/^\d+\.\d+\.\d+$/',$requested);
+        if($unstable&&!$allow)fail('Prereleases require --allow-unstable');
+        return ['ref'=>'refs/tags/v'.$requested,'label'=>$requested,'unstable'=>$unstable];
+    }
+    if($allow&&in_array($requested,$branches,true))return ['ref'=>'refs/heads/'.$requested,'label'=>$requested,'unstable'=>true];
+    fail("Unknown release '$requested'. Missing patch versions never fall back to another branch. For development use --allow-unstable and an explicit branch name.");
+}
+function rewrite_webroot(string $text,string $old,string $new,string $kind): string {
+    // Match the entire directive path: /moodle/public and /moodle2 must not match /moodle.
+    $path='(?:"'.preg_quote($old,'~').'/?"|\x27'.preg_quote($old,'~').'/?\x27|'.preg_quote($old,'~').'/?)(?=[\s;>]|$)';
+    if($kind==='apache'){
+        $text=preg_replace_callback('~(^[\t ]*DocumentRoot[\t ]+)'.$path.'([\t ]*(?:\#.*)?$)~m',fn($m)=>$m[1].'"'.$new.'"'.$m[2],$text);
+        return preg_replace_callback('~(<Directory[\t ]+)'.$path.'([\t ]*>)~',fn($m)=>$m[1].'"'.$new.'"'.$m[2],$text);
+    }
+    return preg_replace_callback('~(^[\t ]*root[\t ]+)'.$path.'([\t ]*;)~m',fn($m)=>$m[1].'"'.$new.'"'.$m[2],$text);
+}
+try {
+$cmd=$argv[1]??'';
+switch($cmd){
+case 'resolve':
+    $tags=json_decode(file_get_contents($argv[2]),true,512,JSON_THROW_ON_ERROR);
+    $names=array_column($tags,'name');
+    $branches=json_decode(file_get_contents($argv[3]),true,512,JSON_THROW_ON_ERROR);
+    echo json_encode(resolve_target($names,$argv[4],$argv[5]==='true',array_column($branches,'name')),JSON_THROW_ON_ERROR);break;
+case 'metadata': echo json_encode(metadata(versionfile($argv[2])),JSON_THROW_ON_ERROR);break;
+case 'inspect':
+    cfg($argv[2]);
+    $server=(string)$DB->get_field_sql('SELECT VERSION()');
+    if(!preg_match('/\d+\.\d+(?:\.\d+)?/',$server,$n))fail('Cannot determine actual database server version');
+    $vendor=$DB->get_dbfamily();
+    if($vendor==='mysql')$vendor=($CFG->dbtype==='mariadb'||stripos($server,'mariadb')!==false)?'mariadb':'mysql';
+    if(!in_array($vendor,['mysql','mariadb','postgres'],true))fail('Supported database families: MariaDB, MySQL, PostgreSQL');
+    $plugins=[];
+    foreach(core_plugin_manager::instance()->get_plugins() as $group){foreach($group as $p){if(!$p->is_standard()){
+        $root=$p->rootdir?realpath($p->rootdir):false;
+        if($root&&!inside($root,$CFG->dirroot))fail('Plugin outside Moodle code tree: '.$p->component);
+        $plugins[]=['component'=>$p->component,'relative'=>$root?substr($root,strlen($CFG->dirroot)+1):null,'status'=>$p->get_status()];
+    }}}
+    $counts=[];foreach(['user','course','course_modules','files'] as $table)$counts[$table]=$DB->count_records($table);
+    $size=$vendor==='postgres'?$DB->get_field_sql('SELECT pg_database_size(current_database())'):$DB->get_field_sql('SELECT COALESCE(SUM(data_length+index_length),0) FROM information_schema.tables WHERE table_schema=DATABASE()');
+    echo json_encode(['release'=>$CFG->release,'build'=>$CFG->version,'branch'=>$CFG->branch,'dirroot'=>$CFG->dirroot,'dataroot'=>realpath($CFG->dataroot),'wwwroot'=>$CFG->wwwroot,'dbvendor'=>$vendor,'dbversion'=>$n[0],'dbbytes'=>(int)$size,'plugins'=>$plugins,'counts'=>$counts,'maintenance'=>(bool)get_config('core','maintenance_enabled')],JSON_THROW_ON_ERROR);break;
+case 'requirements':
+    $current=json_decode(file_get_contents($argv[2]),true,512,JSON_THROW_ON_ERROR);
+    $root=$argv[3];$meta=metadata(versionfile($root));
+    if(!$meta['version']||!$meta['branch']||!$meta['release'])fail('Invalid Moodle version metadata');
+    if($meta['maturity']!==200&&$argv[4]!=='true')fail('Archive is not a stable Moodle release');
+    if((float)$meta['version']<(float)$current['build'])fail('Refusing a build downgrade');
+    $xmlpath=(is_dir("$root/public")?"$root/public":"$root").'/admin/environment.xml';
+    $xml=simplexml_load_file($xmlpath);if(!$xml)fail('Missing or invalid target environment.xml');
+    if(!preg_match('/^(\d+\.\d+)/',$meta['release'],$v))fail('Invalid target release');
+    $match=$xml->xpath('/COMPATIBILITY_MATRIX/MOODLE[@version="'.$v[1].'"]');
+    if(count($match)!==1)fail('No exact environment requirements for target '.$v[1]);$env=$match[0];
+    if((string)$env['requires']!==''&&version_compare($current['release'],(string)$env['requires'],'<'))fail('An intermediate Moodle upgrade to '.(string)$env['requires'].' is required');
+    $minphp=(string)$env->PHP['version'];
+    if(!$minphp||version_compare(PHP_VERSION,$minphp,'<')||PHP_INT_SIZE<8)fail('Target requires 64-bit PHP '.$minphp.' or later');
+    $vendors=$env->xpath('DATABASE/VENDOR[@name="'.$current['dbvendor'].'"]');
+    if(count($vendors)!==1)fail('Database is not supported by the target release');
+    $required=(string)$vendors[0]['version'];
+    if(version_compare($current['dbversion'],$required,'<'))fail('Target requires '.$current['dbvendor'].' '.$required.'; actual server is '.$current['dbversion'].'. Upgrade the database separately.');
+    foreach($env->PHP_EXTENSIONS->PHP_EXTENSION as $ext){
+        if((string)$ext['level']==='required'&&!extension_loaded((string)$ext['name']))fail('Required PHP extension missing: '.(string)$ext['name']);
+    }
+    echo 'Target requirements passed: PHP '.$minphp.', '.$current['dbvendor'].' '.$required."\n";break;
+case 'preserve':
+    $current=json_decode(file_get_contents($argv[2]),true,512,JSON_THROW_ON_ERROR);
+    $target=$argv[3];$web=is_dir("$target/public")?"$target/public":$target;$meta=metadata(versionfile($target));
+    $paths=[];
+    foreach($current['plugins'] as $p){
+        if($p['relative']===null){fwrite(STDERR,'WARNING: Already missing plugin: '.$p['component']."\n");continue;}
+        $rel=$p['relative'];if(!validpath($rel))fail('Invalid plugin path');
+        $pm=metadata($current['dirroot'].'/'.$rel.'/version.php',true);
+        if(isset($pm['requires'])&&(float)$pm['requires']>(float)$meta['version'])fail('Plugin requires a newer Moodle: '.$p['component']);
+        if(isset($pm['supported'])&&((int)$meta['branch']<(int)$pm['supported'][0]||(int)$meta['branch']>(int)$pm['supported'][1]))fail('Plugin does not declare support for target branch: '.$p['component']);
+        $paths[]=$rel;
+    }
+    foreach(array_slice($argv,4) as $rel){if(!validpath($rel)||$rel==='config.php')fail('Invalid preserved path');$paths[]=$rel;}
+    // Parent plugins include their subplugins; do not copy descendants twice.
+    usort($paths,fn($a,$b)=>strlen($a)<=>strlen($b));$done=[];
+    foreach(array_unique($paths) as $rel){
+        foreach($done as $parent){if(inside($rel,$parent))continue 2;}
+        $src=$current['dirroot'].'/'.$rel;$dst=$web.'/'.$rel;
+        if(file_exists($dst)||is_link($dst))fail('Preserved path would overwrite target core code: '.$rel);
+        if(!file_exists($src))fail('Preserved path does not exist: '.$rel);
+        copytree($src,$dst);$done[]=$rel;echo 'Preserved '.$rel."\n";
+    }break;
+case 'db-auth':
+    cfg($argv[2]);$out=$argv[3];$mode=$argv[4];
+    $host=$CFG->dbhost??'localhost';$port=$CFG->dboptions['dbport']??$CFG->dbport??($mode==='postgres'?'5432':'3306');
+    if($mode==='postgres'){
+        $escape=fn($s)=>str_replace(['\\',':'],['\\\\','\\:'],(string)$s);
+        $passhost=str_starts_with((string)$host,'/')?'localhost':$host;
+        $pgpass=implode(':',array_map($escape,[$passhost,$port,$CFG->dbname,$CFG->dbuser,$CFG->dbpass]))."\n";
+        if(preg_match('/[\r\n]/',(string)$CFG->dbpass))fail('Unsupported newline in PostgreSQL password');
+        if(file_put_contents($out,$pgpass)===false)fail('Cannot write credentials');
+    }else{
+        $quote=fn($s)=>'"'.str_replace(['\\','"',"\n","\r"],['\\\\','\\"','\\n','\\r'],(string)$s).'"';
+        $auth="[client]\nhost=".$quote($host)."\nport=".$quote($port)."\nuser=".$quote($CFG->dbuser)."\npassword=".$quote($CFG->dbpass)."\n";
+        if(!empty($CFG->dboptions['dbsocket'])&&is_string($CFG->dboptions['dbsocket']))$auth.='socket='.$quote($CFG->dboptions['dbsocket'])."\n";
+        if(file_put_contents($out,$auth)===false)fail('Cannot write credentials');
+    }
+    chmod($out,0600);
+    echo json_encode(['host'=>$host,'port'=>$port,'user'=>$CFG->dbuser,'name'=>$CFG->dbname],JSON_THROW_ON_ERROR);break;
+case 'cron-pids':
+    cfg($argv[2]);$active=$DB->count_records_select('task_scheduled','timestarted > 0')+$DB->count_records_select('task_adhoc','timestarted > 0');
+    foreach(glob('/proc/[0-9]*/cmdline') as $f){
+        $cmd=@file_get_contents($f);if(!$cmd)continue;$args=explode("\0",$cmd);$exe=@readlink(dirname($f).'/exe');
+        if(!$exe||!preg_match('~/php(?:\d+(?:\.\d+)*)?(?: \(deleted\))?$~',$exe))continue;
+        if(!in_array($argv[2].'/admin/cli/cron.php',$args,true)&&!in_array($argv[2].'/public/admin/cli/cron.php',$args,true))continue;
+        $pid=basename(dirname($f));$idle=!$active&&trim((string)@file_get_contents(dirname($f).'/wchan'))==='hrtimer_nanosleep';
+        echo $pid.' '.($idle?'idle':'busy')."\n";
+    }break;
+case 'webroot':
+    $old=$argv[2];$new=$argv[3];$out=$argv[4];$count=0;
+    foreach(['apache'=>['/etc/apache2/sites-available/*','/etc/apache2/conf-available/*','/etc/httpd/conf/httpd.conf','/etc/httpd/conf.d/*'],'nginx'=>['/etc/nginx/sites-available/*','/etc/nginx/conf.d/*','/etc/nginx/nginx.conf']] as $kind=>$patterns){
+        foreach($patterns as $pattern){foreach(glob($pattern) as $file){
+            if(!is_file($file)||is_link($file)||preg_match('/\.(bak|backup)(\.|$)/',basename($file)))continue;
+            $s=file_get_contents($file);$next=rewrite_webroot($s,$old,$new,$kind);if($next===$s)continue;
+            $dest=$out.$file;if(!is_dir(dirname($dest)))mkdir(dirname($dest),0700,true);
+            if(!copy($file,$dest)||file_put_contents($file,$next)===false)fail('Cannot update '.$file);
+            echo "Updated $file\n";$count++;
+        }}
+    }
+    file_put_contents($out.'/changed',(string)$count);break;
+case 'bootstrap':
+    $file=$argv[2];$public=$argv[3]==='true';$s=file_get_contents($file);
+    if($public){
+        $pattern='~^([\t ]*require(?:_once)?[\t ]*\(?[^;\r\n]*[\x27\"]/?(?:public/)?lib/setup\.php[\x27\"][^;\r\n]*;)~m';
+        // Common config uses __DIR__ . '/lib/setup.php'. Only this bootstrap is rewritten.
+        $replacement="\$CFG->dirroot = __DIR__ . '/public';\n\$CFG->libdir = \$CFG->dirroot . '/lib';\nrequire_once(\$CFG->libdir . '/setup.php');";
+        $next=preg_replace_callback($pattern,fn()=>$replacement,$s,1,$n);
+        if($n!==1)fail('Unrecognized config.php bootstrap; adapt it manually before upgrading to public/');
+        if(file_put_contents($file,$next)===false)fail('Cannot prepare config.php');
+    }break;
+case 'canonical':
+    $path=$argv[2];$suffix=[];
+    while(!file_exists($path)){if($path==='/'||$path==='.'||$path==='')fail('Invalid path');$suffix[]=basename($path);$path=dirname($path);}
+    $path=realpath($path);if($path===false)fail('Cannot resolve path');
+    foreach(array_reverse($suffix) as $part){if($part==='..')$path=dirname($path);elseif($part!=='.')$path=rtrim($path,'/').'/'.$part;}
+    echo $path;break;
+case 'archive-types':
+    foreach(file($argv[2],FILE_IGNORE_NEW_LINES) as $line){if(!in_array($line[0]??'', ['-','d'],true))fail('Archive links and special files are not allowed');}break;
+case 'archive-list':
+    $root=null;foreach(file($argv[2],FILE_IGNORE_NEW_LINES) as $p){
+        if(!$p||$p[0]==='/'||preg_match('~(^|/)\.\.(/|$)|[\x00-\x1f]~',$p))fail('Unsafe archive entry');
+        $first=explode('/',$p)[0];if($root!==null&&$root!==$first)fail('Multiple archive roots');$root=$first;
+    }if(!$root)fail('Empty archive');break;
+case 'rewrite-test': echo rewrite_webroot(file_get_contents($argv[2]),$argv[3],$argv[4],$argv[5]);break;
+case 'hash': echo hash_file('sha256',$argv[2]);break;
+default: fail('Unknown helper command');
+}
+}catch(Throwable $e){fail($e->getMessage());}
+PHP
 }
 
-normalize_version_for_compare() {
-    local raw=${1:-}
-    local version=""
-    version=$(echo "$raw" | grep -oE '[0-9]+(\.[0-9]+){1,2}' | head -1 || true)
-
-    if [[ -z "$version" ]]; then
-        echo "0.0.0"
-        return
-    fi
-
-    local major minor patch
-    IFS='.' read -r major minor patch <<< "$version"
-    echo "${major:-0}.${minor:-0}.${patch:-0}"
+fetch_json() {
+    curl --fail --silent --show-error --location --retry 2 --connect-timeout 20 --max-time 90 "$1" -o "$2"
+    "$PHP_BIN" -r 'json_decode(file_get_contents($argv[1]),true,512,JSON_THROW_ON_ERROR);' "$2"
 }
-
-version_at_least() {
-    local current required
-    current=$(normalize_version_for_compare "$1")
-    required=$(normalize_version_for_compare "$2")
-
-    [[ "$(printf '%s\n' "$required" "$current" | sort -V | head -n1)" == "$required" ]]
-}
-
-moodle_branch_for_version() {
-    local version major minor
-    version=$(normalize_version_for_compare "$1")
-    IFS='.' read -r major minor _ <<< "$version"
-
-    if [[ -z "$major" || -z "$minor" ]]; then
-        return 1
-    fi
-
-    printf 'MOODLE_%d%02d_STABLE' "$major" "$minor"
-}
-
-version_from_moodle_branch() {
-    local branch=$1
-    local number major minor
-    number=${branch#MOODLE_}
-    number=${number%_STABLE}
-
-    if [[ ! "$number" =~ ^[0-9]+$ || ${#number} -lt 2 ]]; then
-        echo "0.0.0"
-        return
-    fi
-
-    major=${number:0:1}
-    minor=${number:1}
-    minor=$((10#$minor))
-    echo "$major.$minor.0"
-}
-
-github_ref_exists() {
-    local ref_path=$1
-    curl -fsSL "https://api.github.com/repos/moodle/moodle/git/ref/$ref_path" >/dev/null 2>&1
-}
-
-get_main_dev_version() {
-    local version_file=""
-    version_file=$(curl -fsSL "https://raw.githubusercontent.com/moodle/moodle/main/public/version.php" 2>/dev/null || true)
-    if [[ -z "$version_file" ]]; then
-        version_file=$(curl -fsSL "https://raw.githubusercontent.com/moodle/moodle/main/version.php" 2>/dev/null || true)
-    fi
-
-    echo "$version_file" | grep -E '^\$release' | head -1 | sed -E "s/.*['\"]([^'\"]+)['\"].*/\1/" || true
-}
-
-# Check and upgrade MariaDB/MySQL version
-check_and_upgrade_mariadb() {
-    local moodle_version=$1
-    
-    # Get current MariaDB/MySQL version
-    local db_version=""
-    if command -v mysql &> /dev/null; then
-        db_version=$(mysql --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
-        local db_type=$(mysql --version 2>/dev/null | grep -i mariadb &>/dev/null && echo "mariadb" || echo "mysql")
-    else
-        warning "MySQL/MariaDB client not found"
-        return
-    fi
-    
-    if [[ -z "$db_version" ]]; then
-        warning "Could not determine database version"
-        return
-    fi
-    
-    log "Current database: $db_type $db_version"
-    
-    # Define minimum requirements. Moodle 5.0 raised MySQL/MariaDB requirements.
-    local required_mariadb="10.6.7"
-    local required_mysql="8.0.0"
-
-    if version_at_least "$moodle_version" "5.0"; then
-        required_mariadb="10.11.0"
-        required_mysql="8.4.0"
-    fi
-    
-    local needs_upgrade=false
-    local recommended_version=""
-    
-    if [[ "$db_type" == "mariadb" ]]; then
-        if [[ "$(printf '%s\n' "$required_mariadb" "$db_version" | sort -V | head -n1)" != "$required_mariadb" ]]; then
-            needs_upgrade=true
-            recommended_version="${required_mariadb%.*}"
-        fi
-    elif [[ "$db_type" == "mysql" ]]; then
-        if [[ "$(printf '%s\n' "$required_mysql" "$db_version" | sort -V | head -n1)" != "$required_mysql" ]]; then
-            needs_upgrade=true
-            recommended_version="${required_mysql%.*}"
-        fi
-    fi
-    
-    if [[ "$needs_upgrade" == "true" ]]; then
-        warning "$db_type $db_version is below the minimum required version for Moodle $moodle_version"
-        log "Required: $db_type $recommended_version+"
-        
-        if ask_yes_no "Do you want to upgrade $db_type automatically?"; then
-            upgrade_mariadb_mysql "$db_type" "$recommended_version"
-        else
-            error "Database upgrade skipped, but Moodle $moodle_version requires $db_type $recommended_version+"
-            exit 1
-        fi
-    else
-        success "$db_type version $db_version meets requirements"
-    fi
-}
-
-# Upgrade MariaDB/MySQL
-upgrade_mariadb_mysql() {
-    local db_type=$1
-    local target_version=$2
-    
-    if [[ "$ASSUME_YES" == "true" && "$ALLOW_SYSTEM_CHANGES" != "true" ]]; then
-        error "Refusing unattended $db_type package upgrade without --allow-system-changes"
-        warning "Upgrade $db_type manually, or rerun with --yes --allow-system-changes."
-        exit 1
-    fi
-
-    log "Upgrading $db_type to version $target_version..."
-    
-    # Create database backup before upgrade
-    if ask_yes_no "Create database backup before upgrade? (HIGHLY RECOMMENDED)"; then
-        create_emergency_db_backup
-    fi
-    
-    # Stop database service
-    log "Stopping database service..."
-    systemctl stop mysql 2>/dev/null || systemctl stop mariadb 2>/dev/null || true
-    
-    if [[ "$db_type" == "mariadb" ]]; then
-        upgrade_mariadb "$target_version"
-    else
-        upgrade_mysql "$target_version"
-    fi
-    
-    # Start database service
-    log "Starting database service..."
-    systemctl start mysql 2>/dev/null || systemctl start mariadb 2>/dev/null || true
-    
-    # Wait for service to be ready
-    for i in {1..30}; do
-        if mysqladmin ping &>/dev/null; then
-            break
-        fi
-        sleep 1
-    done
-    
-    # Run mysql_upgrade
-    log "Running database upgrade process..."
-    mysql_upgrade 2>/dev/null || true
-    
-    # Restart service to ensure clean state
-    systemctl restart mysql 2>/dev/null || systemctl restart mariadb 2>/dev/null || true
-    
-    # Verify upgrade
-    local new_version=$(mysql --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
-    success "$db_type upgraded to version $new_version"
-}
-
-# Upgrade MariaDB
-upgrade_mariadb() {
-    local target_version=$1
-    
-    log "Upgrading MariaDB to $target_version..."
-    
-    if command -v apt-get &> /dev/null; then
-        # Ubuntu/Debian
-        log "Adding MariaDB repository..."
-        
-        # Install prerequisites
-        apt-get update
-        apt-get install -y software-properties-common dirmngr apt-transport-https
-        
-        # Add MariaDB repository key
-        curl -sS https://mariadb.org/mariadb_release_signing_key.asc | apt-key add -
-        
-        # Add repository based on target version
-        local ubuntu_codename=$(lsb_release -cs)
-        echo "deb [arch=amd64] https://mirror.mariadb.org/repo/$target_version/ubuntu $ubuntu_codename main" > /etc/apt/sources.list.d/mariadb.list
-        
-        # Update package list
-        apt-get update
-        
-        # Upgrade MariaDB
-        log "Installing MariaDB $target_version..."
-        DEBIAN_FRONTEND=noninteractive apt-get install -y \
-            mariadb-server \
-            mariadb-client \
-            mariadb-common \
-            mariadb-server-core
-            
-    elif command -v yum &> /dev/null; then
-        # CentOS/RHEL
-        log "Adding MariaDB repository for CentOS/RHEL..."
-        
-        cat > /etc/yum.repos.d/MariaDB.repo << EOF
-[mariadb]
-name = MariaDB
-baseurl = https://mirror.mariadb.org/yum/$target_version/centos7-amd64
-gpgkey = https://mirror.mariadb.org/yum/RPM-GPG-KEY-MariaDB
-gpgcheck = 1
-EOF
-        
-        yum update -y
-        yum install -y MariaDB-server MariaDB-client
-        
-    else
-        error "Unsupported package manager for MariaDB upgrade"
-        return 1
-    fi
-}
-
-# Upgrade MySQL
-upgrade_mysql() {
-    local target_version=$1
-    
-    log "Upgrading MySQL to $target_version..."
-    
-    if command -v apt-get &> /dev/null; then
-        # Ubuntu/Debian
-        log "Adding MySQL repository..."
-        
-        # Download and install MySQL APT repository
-        wget -O /tmp/mysql-apt-config.deb https://dev.mysql.com/get/mysql-apt-config_0.8.24-1_all.deb
-        DEBIAN_FRONTEND=noninteractive dpkg -i /tmp/mysql-apt-config.deb
-        
-        apt-get update
-        DEBIAN_FRONTEND=noninteractive apt-get install -y mysql-server mysql-client
-        
-    elif command -v yum &> /dev/null; then
-        # CentOS/RHEL
-        log "Adding MySQL repository for CentOS/RHEL..."
-        
-        yum install -y https://dev.mysql.com/get/mysql80-community-release-el7-3.noarch.rpm
-        yum update -y
-        yum install -y mysql-community-server mysql-community-client
-        
-    else
-        error "Unsupported package manager for MySQL upgrade"
-        return 1
-    fi
-}
-
-# Create emergency database backup
-create_emergency_db_backup() {
-    local emergency_backup_dir="/tmp/emergency_db_backup_$(date +%Y%m%d_%H%M%S)"
-    mkdir -p "$emergency_backup_dir"
-    
-    log "Creating emergency database backup in $emergency_backup_dir..."
-    
-    # Get all databases
-    local databases=$(mysql -e "SHOW DATABASES;" | grep -Ev "(Database|information_schema|performance_schema|mysql|sys)")
-    
-    for db in $databases; do
-        if [[ -n "$db" ]]; then
-            log "Backing up database: $db"
-            mysqldump --single-transaction --routines --triggers "$db" > "$emergency_backup_dir/${db}.sql" 2>/dev/null || true
-        fi
-    done
-    
-    success "Emergency backup created in: $emergency_backup_dir"
-    echo "$emergency_backup_dir" > /tmp/last_emergency_backup_path
-}
-check_php_requirements() {
-    local moodle_version=$1
-    local current_php_version
-    current_php_version=$(php -r "echo PHP_VERSION;")
-    local required_php="8.1"
-    local recommended_php="8.3"
-
-    if version_at_least "$moodle_version" "5.2"; then
-        required_php="8.3"
-        recommended_php="8.3"
-    elif version_at_least "$moodle_version" "5.0"; then
-        required_php="8.2"
-        recommended_php="8.3"
-    elif version_at_least "$moodle_version" "4.4"; then
-        required_php="8.1"
-        recommended_php="8.2"
-    elif version_at_least "$moodle_version" "4.2"; then
-        required_php="8.0"
-        recommended_php="8.2"
-    else
-        required_php="7.4"
-        recommended_php="8.1"
-    fi
-
-    log "Current PHP version: $current_php_version"
-    log "Minimum PHP version for Moodle $moodle_version: $required_php"
-    log "Recommended PHP version: $recommended_php"
-
-    if ! version_at_least "$current_php_version" "$required_php"; then
-        error "PHP version $current_php_version is too old for Moodle $moodle_version"
-        warning "Please upgrade PHP to at least version $required_php"
-
-        if ask_yes_no "Should we try to upgrade PHP automatically?"; then
-            upgrade_php "$recommended_php"
-            current_php_version=$(php -r "echo PHP_VERSION;")
-            if ! version_at_least "$current_php_version" "$required_php"; then
-                error "PHP is still $current_php_version after upgrade attempt"
-                exit 1
-            fi
-        else
-            exit 1
-        fi
-    else
-        success "PHP version $current_php_version meets the requirements"
-
-        if ! version_at_least "$current_php_version" "$recommended_php"; then
-            warning "Recommended PHP version is $recommended_php (current: $current_php_version)"
-        fi
-    fi
-
-    if version_at_least "$moodle_version" "5.0"; then
-        if ! php -m | grep -qi '^sodium$'; then
-            error "PHP extension sodium is required for Moodle $moodle_version"
-            warning "Install the sodium extension for your PHP version before continuing."
-            exit 1
-        fi
-    fi
-
-    if [[ "$(php -r 'echo PHP_INT_SIZE;')" -lt 8 ]]; then
-        error "Moodle requires 64-bit PHP"
-        exit 1
-    fi
-}
-
-# PHP upgrade (Ubuntu/Debian)
-upgrade_php() {
-    local target_version=$1
-
-    if [[ "$ASSUME_YES" == "true" && "$ALLOW_SYSTEM_CHANGES" != "true" ]]; then
-        error "Refusing unattended PHP package upgrade without --allow-system-changes"
-        warning "Install PHP $target_version manually, or rerun with --yes --allow-system-changes."
-        exit 1
-    fi
-
-    log "Attempting to upgrade PHP to version $target_version..."
-
-    if command -v apt-get &> /dev/null; then
-        apt-get update
-        apt-get install -y software-properties-common
-        if command -v add-apt-repository &> /dev/null; then
-            add-apt-repository -y ppa:ondrej/php || true
-        fi
-        apt-get update
-
-        local packages=(
-            "php${target_version}"
-            "php${target_version}-cli"
-            "php${target_version}-fpm"
-            "php${target_version}-mysql"
-            "php${target_version}-pgsql"
-            "php${target_version}-xml"
-            "php${target_version}-mbstring"
-            "php${target_version}-curl"
-            "php${target_version}-zip"
-            "php${target_version}-gd"
-            "php${target_version}-intl"
-            "php${target_version}-ldap"
-            "php${target_version}-soap"
-        )
-
-        if command -v apache2ctl &> /dev/null || [[ -d /etc/apache2 ]]; then
-            packages+=("libapache2-mod-php${target_version}")
-        fi
-
-        DEBIAN_FRONTEND=noninteractive apt-get install -y "${packages[@]}"
-
-        if [[ -x "/usr/bin/php${target_version}" ]]; then
-            update-alternatives --set php "/usr/bin/php${target_version}" 2>/dev/null || true
-        fi
-
-        if command -v a2query &> /dev/null && command -v a2enmod &> /dev/null; then
-            while read -r module; do
-                [[ -n "$module" ]] && a2dismod "$module" >/dev/null 2>&1 || true
-            done < <(a2query -m 2>/dev/null | awk '/php[0-9]+\.[0-9]+/ {print $1}')
-            a2enmod "php${target_version}" >/dev/null 2>&1 || true
-        fi
-
-        success "PHP has been upgraded to version $target_version"
-    else
-        warning "Automatic PHP upgrade is only supported on Ubuntu/Debian"
-        error "Please upgrade PHP manually"
-        exit 1
-    fi
-}
-
-# Get current Moodle version
-get_current_moodle_version() {
-    local moodle_path=$1
-    local version_file=""
-
-    if [[ -f "$moodle_path/version.php" ]]; then
-        version_file="$moodle_path/version.php"
-    elif [[ -f "$moodle_path/public/version.php" ]]; then
-        version_file="$moodle_path/public/version.php"
-    fi
-
-    if [[ -n "$version_file" ]]; then
-        grep -E '^\$release' "$version_file" | head -1 | sed -E "s/.*['\"]([^'\"]+)['\"].*/\1/" || echo "unknown"
-        return
-    fi
-
-    echo "unknown"
-}
-
-# Get available Moodle versions from GitHub
-get_latest_moodle_versions() {
-    local versions
-    versions=$(curl -fsSL "https://api.github.com/repos/moodle/moodle/tags?per_page=100" | \
-        grep '"name"' | \
-        sed 's/.*"name": "v\([^"]*\)".*/\1/' | \
-        grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | \
-        sort -V -r | \
-        head -20)
-    
-    echo "$versions"
-}
-
 resolve_moodle_target() {
     local requested=$1
-    local available_versions=$2
-    local stable_match=""
-    local dev_version=""
-
-    TARGET_DOWNLOAD_URL=""
-    TARGET_REF_LABEL=""
-    TARGET_IS_UNSTABLE=false
-    TARGET_VERSION_FOR_COMPARE="$requested"
-    RESOLVED_TARGET_VERSION="$requested"
-
-    if [[ "$requested" == "latest" ]]; then
-        requested=$(echo "$available_versions" | head -1)
+    fetch_json 'https://api.github.com/repos/moodle/moodle/tags?per_page=100' "$WORK_DIR/tags.json"
+    # An exact older release may be outside GitHub's first page of tags.
+    if [[ "$requested" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-(beta|rc[0-9]+))?$ ]] &&
+        ! "$PHP_BIN" -r '$tags=json_decode(file_get_contents($argv[1]),true,512,JSON_THROW_ON_ERROR);exit(in_array("v".$argv[2],array_column($tags,"name"),true)?0:1);' "$WORK_DIR/tags.json" "$requested"; then
+        fetch_json "https://api.github.com/repos/moodle/moodle/git/ref/tags/v$requested" "$WORK_DIR/exact-tag.json"
+        "$PHP_BIN" -r '$r=json_decode(file_get_contents($argv[2]),true,512,JSON_THROW_ON_ERROR);if(($r["ref"]??"")!=="refs/tags/v".$argv[3])exit(1);$t=json_decode(file_get_contents($argv[1]),true,512,JSON_THROW_ON_ERROR);$t[]=["name"=>"v".$argv[3]];file_put_contents($argv[1],json_encode($t,JSON_THROW_ON_ERROR));' "$WORK_DIR/tags.json" "$WORK_DIR/exact-tag.json" "$requested"
     fi
-
-    if [[ "$requested" =~ ^[0-9]+\.[0-9]+$ ]]; then
-        stable_match=$(echo "$available_versions" | grep -E "^${requested//./\\.}\\.[0-9]+$" | head -1 || true)
-        if [[ -n "$stable_match" ]]; then
-            requested="$stable_match"
-        fi
+    printf '[]' > "$WORK_DIR/branches.json"
+    if [[ "$ALLOW_UNSTABLE" == true ]]; then
+        fetch_json 'https://api.github.com/repos/moodle/moodle/branches?per_page=100' "$WORK_DIR/branches.json"
     fi
-
-    if [[ "$requested" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-        if github_ref_exists "tags/v${requested}"; then
-            TARGET_DOWNLOAD_URL="https://github.com/moodle/moodle/archive/refs/tags/v${requested}.tar.gz"
-            TARGET_REF_LABEL="tag v${requested}"
-            TARGET_VERSION_FOR_COMPARE="$requested"
-            RESOLVED_TARGET_VERSION="$requested"
-            return
-        fi
-    fi
-
-    if [[ "$requested" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?-(beta|rc[0-9]+)$ ]]; then
-        if [[ "$ALLOW_UNSTABLE" != "true" ]]; then
-            error "Target $requested is not a stable Moodle release. Use --allow-unstable to install it."
-            exit 1
-        fi
-        if github_ref_exists "tags/v${requested}"; then
-            TARGET_DOWNLOAD_URL="https://github.com/moodle/moodle/archive/refs/tags/v${requested}.tar.gz"
-            TARGET_REF_LABEL="pre-release tag v${requested}"
-            TARGET_IS_UNSTABLE=true
-            TARGET_VERSION_FOR_COMPARE="$requested"
-            RESOLVED_TARGET_VERSION="$requested"
-            return
-        fi
-    fi
-
-    if [[ "$requested" =~ ^MOODLE_[0-9]+_STABLE$ ]]; then
-        if ! github_ref_exists "heads/${requested}"; then
-            error "Moodle branch $requested was not found"
-            exit 1
-        fi
-        TARGET_DOWNLOAD_URL="https://github.com/moodle/moodle/archive/refs/heads/${requested}.tar.gz"
-        TARGET_REF_LABEL="branch ${requested}"
-        TARGET_VERSION_FOR_COMPARE=$(version_from_moodle_branch "$requested")
-        TARGET_IS_UNSTABLE=false
-        RESOLVED_TARGET_VERSION="$requested"
-        return
-    fi
-
-    if [[ "$requested" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
-        local stable_branch
-        stable_branch=$(moodle_branch_for_version "$requested")
-        if github_ref_exists "heads/${stable_branch}"; then
-            TARGET_DOWNLOAD_URL="https://github.com/moodle/moodle/archive/refs/heads/${stable_branch}.tar.gz"
-            TARGET_REF_LABEL="stable branch ${stable_branch}"
-            TARGET_VERSION_FOR_COMPARE="$requested"
-            RESOLVED_TARGET_VERSION="$requested"
-            return
-        fi
-
-        dev_version=$(get_main_dev_version)
-        if [[ -n "$dev_version" && "$(normalize_version_for_compare "$dev_version")" == "$(normalize_version_for_compare "$requested")" ]]; then
-            if [[ "$ALLOW_UNSTABLE" != "true" ]]; then
-                error "Moodle $requested is currently only available as $dev_version on the main branch."
-                warning "Use --allow-unstable only for staging/test systems, not for production."
-                exit 1
-            fi
-            TARGET_DOWNLOAD_URL="https://github.com/moodle/moodle/archive/refs/heads/main.tar.gz"
-            TARGET_REF_LABEL="main branch (${dev_version})"
-            TARGET_IS_UNSTABLE=true
-            TARGET_VERSION_FOR_COMPARE="$dev_version"
-            RESOLVED_TARGET_VERSION="$dev_version"
-            return
-        fi
-    fi
-
-    error "Moodle target $requested was not found as a stable tag or known branch"
-    warning "Stable versions found: $(echo "$available_versions" | head -5 | tr '\n' ' ')"
-    exit 1
+    php_helper resolve "$WORK_DIR/tags.json" "$WORK_DIR/branches.json" "$requested" "$ALLOW_UNSTABLE" > "$WORK_DIR/target.json"
+}
+prepare_target() {
+    local ref
+    ref=$(json_value "$WORK_DIR/target.json" ref)
+    log "Downloading $(json_value "$WORK_DIR/target.json" label) before maintenance"
+    curl --fail --silent --show-error --location --retry 2 --connect-timeout 20 --max-time 600 \
+        "https://github.com/moodle/moodle/archive/$ref.tar.gz" -o "$WORK_DIR/moodle.tar.gz"
+    tar -tzf "$WORK_DIR/moodle.tar.gz" > "$WORK_DIR/archive-list.txt"
+    php_helper archive-list "$WORK_DIR/archive-list.txt"
+    tar -tvzf "$WORK_DIR/moodle.tar.gz" > "$WORK_DIR/archive-types.txt"
+    php_helper archive-types "$WORK_DIR/archive-types.txt"
+    mkdir "$STAGE_DIR/new"
+    tar --no-same-owner -xzf "$WORK_DIR/moodle.tar.gz" --strip-components=1 -C "$STAGE_DIR/new"
+    [[ -f "$STAGE_DIR/new/admin/cli/upgrade.php" ]] || die "Archive has no Moodle CLI upgrader"
+    # Do not carry archive symlinks into a privileged filesystem operation.
+    [[ -z "$(find "$STAGE_DIR/new" -type l -print -quit)" ]] || die "Archive symlinks require manual review"
+    php_helper metadata "$STAGE_DIR/new" > "$WORK_DIR/target-metadata.json"
 }
 
-# Compare versions
-version_compare() {
-    local version1=$1
-    local version2=$2
-    version1=$(normalize_version_for_compare "$version1")
-    version2=$(normalize_version_for_compare "$version2")
-    
-    if [[ "$version1" == "$version2" ]]; then
-        echo "0"
-    elif printf '%s\n%s' "$version1" "$version2" | sort -V -C; then
-        echo "-1"  # version1 < version2
-    else
-        echo "1"   # version1 > version2
+check_disk_space() {
+    local data_kb code_kb db_kb backup_kb available parent_available filedir_kb=0
+    data_kb=$(du -sk "$DATA_PATH" | awk '{print $1}')
+    code_kb=$(du -sk "$MOODLE_PATH" | awk '{print $1}')
+    db_kb=$(( $(json_value "$WORK_DIR/current.json" dbbytes) / 1024 + 1 ))
+    if [[ "$BACKUP_MODE" == hardlink && -d "$DATA_PATH/filedir" ]]; then
+        [[ "$(stat -c %d "$DATA_PATH/filedir")" == "$(stat -c %d "$BACKUP_ROOT")" ]] || die "Hardlink backup needs the same filesystem as filedir"
+        filedir_kb=$(du -sk "$DATA_PATH/filedir" | awk '{print $1}')
     fi
+    backup_kb=$((data_kb - filedir_kb + code_kb + db_kb * 2 + 524288))
+    available=$(df -Pk "$BACKUP_ROOT" | awk 'END {print $4}')
+    parent_available=$(df -Pk "$(dirname "$MOODLE_PATH")" | awk 'END {print $4}')
+    (( available >= backup_kb )) || die "Insufficient backup space: need about $((backup_kb/1024)) MiB, have $((available/1024)) MiB. Choose another --backup-dir or explicitly choose --backup-mode hardlink."
+    (( parent_available >= 262144 )) || die "Less than 256 MiB free on the code filesystem after staging"
+    log "Backup space check passed ($BACKUP_MODE; allowance $((backup_kb/1024)) MiB)"
 }
-
-# Create backup
-create_backup() {
-    local moodle_path=$1
-    local moodledata_path=$2
-    local backup_dir=${3:-"/tmp/moodle_backup_$(date +%Y%m%d_%H%M%S)"}
-    
-    log "Creating backup in $backup_dir..."
-    
-    mkdir -p "$backup_dir"
-    
-    # Moodle code backup
-    log "Backing up Moodle code..."
-    cp -r "$moodle_path" "$backup_dir/moodle_code"
-    
-    # Backup config.php separately
-    if [[ -f "$moodle_path/config.php" ]]; then
-        cp "$moodle_path/config.php" "$backup_dir/config.php.backup"
-    fi
-    
-    # Moodledata backup (only config and important files)
-    log "Backing up important Moodledata files..."
-    mkdir -p "$backup_dir/moodledata_essential"
-    
-    if [[ -d "$moodledata_path" ]]; then
-        # Only backup important directories (not all files)
-        for dir in cache sessions temp trashdir; do
-            if [[ -d "$moodledata_path/$dir" ]]; then
-                cp -r "$moodledata_path/$dir" "$backup_dir/moodledata_essential/" 2>/dev/null || true
-            fi
-        done
-    fi
-    
-    success "Backup created: $backup_dir"
+check_staging_space() {
+    local code_kb available work_available needed
+    code_kb=$(du -sk "$MOODLE_PATH" | awk '{print $1}')
+    available=$(df -Pk "$(dirname "$MOODLE_PATH")" | awk 'END {print $4}')
+    work_available=$(df -Pk "$WORK_DIR" | awk 'END {print $4}')
+    needed=$((code_kb * 2 + 524288))
+    (( available >= needed && work_available >= 262144 )) || die "Insufficient space to download/extract a release safely before maintenance"
 }
-
-read_moodle_config_value() {
-    local moodle_path=$1
-    local key=$2
-    local default=${3:-}
-    local config_file="$moodle_path/config.php"
-    local value=""
-
-    if [[ ! -f "$config_file" ]]; then
-        echo "$default"
-        return
-    fi
-
-    value=$(php -r '
-        define("CLI_SCRIPT", true);
-        error_reporting(E_ERROR | E_PARSE);
-        $configfile = $argv[1];
-        $key = $argv[2];
-        $default = $argv[3];
-        $CFG = new stdClass();
-        require $configfile;
-        echo isset($CFG->{$key}) ? $CFG->{$key} : $default;
-    ' "$config_file" "$key" "$default" 2>/dev/null || true)
-
-    if [[ -z "$value" || "$value" == *"Command line scripts must define CLI_SCRIPT"* ]]; then
-        value=$(grep -E "\\\$CFG->${key}[[:space:]]*=" "$config_file" | head -1 | sed -E "s/.*=[[:space:]]*['\"]([^'\"]*)['\"].*/\1/" || true)
-    fi
-
-    if [[ -z "$value" ]]; then
-        echo "$default"
-    else
-        echo "$value"
-    fi
+validate_cron_sources() {
+    [[ "$CRON_PAUSED" == true ]] && return 0
+    local file
+    for file in /etc/crontab /etc/cron.d/*; do
+        [[ -f "$file" ]] || continue
+        if grep -v '^[[:space:]]*#' "$file" | grep -F "$MOODLE_PATH" | grep -q 'admin/cli/cron.php'; then
+            die "Moodle cron found in $file. Pause it externally, then pass --cron-paused."
+        fi
+    done
+    # systemd timers and remote schedulers cannot reliably be discovered here.
+    require_command crontab
 }
-
-# Database backup
+pause_cron() {
+    [[ "$CRON_PAUSED" == true ]] && return 0
+    local user before after
+    for user in root "$WEB_USER"; do
+        [[ -f "$WORK_DIR/cron-$user.before" ]] && continue
+        before="$WORK_DIR/cron-$user.before"; after="$WORK_DIR/cron-$user.paused"
+        if ! crontab -u "$user" -l > "$before" 2> "$WORK_DIR/cron-read.err"; then
+            if grep -qi 'no crontab' "$WORK_DIR/cron-read.err"; then rm -f "$before"; continue; fi
+            die "Cannot read crontab for $user"
+        fi
+        "$PHP_BIN" -r '$s=file($argv[1]);foreach($s as &$l){if(!preg_match("/^\\s*#/",$l)&&str_contains($l,$argv[3])&&str_contains($l,"admin/cli/cron.php"))$l="# moodle-updater paused: ".$l;}unset($l);file_put_contents($argv[2],implode("",$s));' "$before" "$after" "$MOODLE_PATH"
+        if ! cmp -s "$before" "$after"; then
+            # Record before mutating, so a failed crontab write can also be recovered.
+            CRON_SAVED+=("$user")
+            crontab -u "$user" "$after"
+            log "Paused Moodle cron for $user"
+        fi
+    done
+}
+restore_cron() {
+    local user status=0
+    for user in "${CRON_SAVED[@]}"; do
+        # Remove only our markers, retaining unrelated concurrent crontab edits.
+        if crontab -u "$user" -l > "$WORK_DIR/cron-$user.current" &&
+            "$PHP_BIN" -r '$s=file_get_contents($argv[1]);$s=preg_replace("/^# moodle-updater paused: /m","",$s);file_put_contents($argv[2],$s);' "$WORK_DIR/cron-$user.current" "$WORK_DIR/cron-$user.restored" &&
+            crontab -u "$user" "$WORK_DIR/cron-$user.restored"; then
+            log "Restored cron for $user"
+        else error "Could not restore cron for $user"; status=1; fi
+    done
+    return "$status"
+}
+re_pause_cron() {
+    local user
+    for user in "${CRON_SAVED[@]}"; do
+        crontab -u "$user" -l > "$WORK_DIR/cron-$user.recovery-current" || return 1
+        "$PHP_BIN" -r '$s=file($argv[1]);foreach($s as &$l){if(!preg_match("/^\\s*#/",$l)&&str_contains($l,$argv[3])&&str_contains($l,"admin/cli/cron.php"))$l="# moodle-updater paused: ".$l;}unset($l);file_put_contents($argv[2],implode("",$s));' "$WORK_DIR/cron-$user.recovery-current" "$WORK_DIR/cron-$user.recovery-paused" "$MOODLE_PATH" || return 1
+        crontab -u "$user" "$WORK_DIR/cron-$user.recovery-paused" || return 1
+    done
+}
+wait_for_cron() {
+    local attempt pid state count
+    for ((attempt=0;attempt<24;attempt++)); do
+        php_helper cron-pids "$MOODLE_PATH" > "$WORK_DIR/cron-pids"
+        count=0
+        while read -r pid state; do
+            [[ -n "$pid" ]] || continue
+            count=$((count+1))
+            if [[ "$state" == idle ]]; then kill -TERM "$pid" 2>/dev/null || true; fi
+        done < "$WORK_DIR/cron-pids"
+        [[ "$count" == 0 ]] && return 0
+        (( attempt % 6 != 0 )) || log "Waiting for existing Moodle cron workers"
+        sleep 5
+    done
+    die "Cron is still active after 120 seconds; code was not replaced"
+}
+enable_maintenance_mode() {
+    if [[ ! -f "$DATA_PATH/climaintenance.html" ]]; then
+        MAINTENANCE_CHANGED=true
+        as_web "$MOODLE_PATH/admin/cli/maintenance.php" --enable
+    fi
+    [[ -f "$DATA_PATH/climaintenance.html" ]] || die "CLI maintenance file was not created"
+}
+disable_maintenance_mode() {
+    [[ "$MAINTENANCE_CHANGED" == true ]] || return 0
+    as_web "$MOODLE_PATH/admin/cli/maintenance.php" --disable
+    [[ ! -e "$DATA_PATH/climaintenance.html" ]] || die "CLI maintenance is still enabled"
+}
 backup_database() {
-    local moodle_path=$1
-    local backup_dir=$2
-    
-    if [[ ! -f "$moodle_path/config.php" ]]; then
-        warning "No config.php found - database backup skipped"
-        return
+    local vendor name host port user
+    vendor=$(json_value "$WORK_DIR/current.json" dbvendor)
+    DB_AUTH_FILE="$WORK_DIR/db-auth"
+    php_helper db-auth "$MOODLE_PATH" "$DB_AUTH_FILE" "$vendor" > "$WORK_DIR/db-connection.json"
+    name=$(json_value "$WORK_DIR/db-connection.json" name)
+    [[ "$name" != -* && -n "$name" ]] || die "Invalid database name"
+    if [[ "$vendor" == postgres ]]; then
+        host=$(json_value "$WORK_DIR/db-connection.json" host)
+        port=$(json_value "$WORK_DIR/db-connection.json" port)
+        user=$(json_value "$WORK_DIR/db-connection.json" user)
+        PGPASSFILE="$DB_AUTH_FILE" pg_dump --no-password --host="$host" --port="$port" --username="$user" --format=custom --file="$BACKUP_DIR/database.dump" -- "$name"
+        pg_restore --list "$BACKUP_DIR/database.dump" > "$BACKUP_DIR/database.contents"
+    else
+        mysqldump --defaults-file="$DB_AUTH_FILE" --single-transaction --routines --triggers --quick --hex-blob -- "$name" > "$BACKUP_DIR/database.sql"
+        [[ -s "$BACKUP_DIR/database.sql" ]] || die "Database dump is empty"
     fi
-    
-    log "Creating database backup..."
-    
-    # Extract DB configuration from config.php with CLI_SCRIPT defined.
-    local db_type
-    local db_host
-    local db_name
-    local db_user
-    local db_pass
-    local db_port
-    db_type=$(read_moodle_config_value "$moodle_path" "dbtype" "")
-    db_host=$(read_moodle_config_value "$moodle_path" "dbhost" "localhost")
-    db_name=$(read_moodle_config_value "$moodle_path" "dbname" "")
-    db_user=$(read_moodle_config_value "$moodle_path" "dbuser" "")
-    db_pass=$(read_moodle_config_value "$moodle_path" "dbpass" "")
-    db_port=$(read_moodle_config_value "$moodle_path" "dbport" "3306")
-    
-    log "Database type: $db_type"
-    log "Database host: $db_host"
-    log "Database name: $db_name"
-    
-    if [[ -z "$db_name" || -z "$db_user" ]]; then
-        warning "Database settings incomplete - backup skipped"
-        return
+    rm -f "$DB_AUTH_FILE"; DB_AUTH_FILE=
+}
+create_backup() {
+    log "Creating complete backup in $BACKUP_DIR"
+    cp -a "$MOODLE_PATH" "$BACKUP_DIR/code"
+    mkdir "$BACKUP_DIR/moodledata"
+    if [[ "$BACKUP_MODE" == hardlink && -d "$DATA_PATH/filedir" ]]; then
+        cp -al "$DATA_PATH/filedir" "$BACKUP_DIR/moodledata/filedir"
+        tar --exclude='./filedir' -C "$DATA_PATH" -cf - . | tar -C "$BACKUP_DIR/moodledata" -xf -
+    else
+        cp -a "$DATA_PATH/." "$BACKUP_DIR/moodledata/"
     fi
-    
-    if [[ "$db_type" == "mysqli" || "$db_type" == "mariadb" ]]; then
-        if command -v mysqldump &> /dev/null; then
-            log "Creating MySQL/MariaDB backup..."
-            
-            # Create MySQL options file for security
-            local mysql_opts_file="$backup_dir/.mysql_opts"
-            cat > "$mysql_opts_file" << EOF
-[client]
-host=$db_host
-port=$db_port
-user=$db_user
-password=$db_pass
-EOF
-            chmod 600 "$mysql_opts_file"
-            
-            if mysqldump --defaults-file="$mysql_opts_file" \
-                --single-transaction \
-                --routines \
-                --triggers \
-                --quick \
-                --add-drop-table \
-                "$db_name" > "$backup_dir/database_backup.sql" 2>/dev/null; then
-                success "MySQL/MariaDB backup created ($(du -h "$backup_dir/database_backup.sql" | cut -f1))"
-            else
-                warning "MySQL backup failed - check credentials and permissions"
-                log "Trying alternative backup method..."
-                if mysql --defaults-file="$mysql_opts_file" -e "USE $db_name; SHOW TABLES;" &>/dev/null; then
-                    mysqldump --defaults-file="$mysql_opts_file" --no-data "$db_name" > "$backup_dir/database_structure.sql" 2>/dev/null || true
-                    warning "Only database structure backed up"
-                else
-                    error "Cannot connect to database"
+    backup_database
+    cp "$WORK_DIR/current.json" "$BACKUP_DIR/before.json"
+    cp "$WORK_DIR/target-metadata.json" "$BACKUP_DIR/target.json"
+    cp "$WORK_DIR/target.json" "$BACKUP_DIR/source.json"
+    printf '%s  moodle.tar.gz\n' "$(php_helper hash "$WORK_DIR/moodle.tar.gz")" > "$BACKUP_DIR/source.sha256"
+    local file
+    for file in "$WORK_DIR"/cron-*.before; do [[ ! -f "$file" ]] || cp "$file" "$BACKUP_DIR/"; done
+    printf 'code=%s\ndata=%s\nbackup_mode=%s\ninitial_cli_maintenance=%s\n' "$MOODLE_PATH" "$DATA_PATH" "$BACKUP_MODE" "$INITIAL_CLI_MAINTENANCE" > "$BACKUP_DIR/paths.txt"
+    for file in "$BACKUP_DIR"/database.sql "$BACKUP_DIR"/database.dump; do
+        [[ ! -f "$file" ]] || printf '%s  %s\n' "$(php_helper hash "$file")" "$(basename "$file")" > "$BACKUP_DIR/database.sha256"
+    done
+    printf 'Complete code, moodledata and database backup\n' > "$BACKUP_DIR/BACKUP_COMPLETE"
+}
+web_configtest() {
+    case "$WEB_SERVICE" in
+        apache2) apache2ctl configtest ;;
+        httpd) httpd -t ;;
+        nginx) nginx -t ;;
+        *) die "Cannot determine active Apache/Nginx service" ;;
+    esac
+}
+update_webroot_for_public_dir() {
+    [[ "$SKIP_WEBROOT_UPDATE" == true || ! -d "$MOODLE_PATH/public" ]] && return 0
+    mkdir -p "$BACKUP_DIR/webserver"
+    # Mark before modifying so partial configuration changes are also restored.
+    WEB_CHANGED=true
+    php_helper webroot "$MOODLE_PATH" "$MOODLE_PATH/public" "$BACKUP_DIR/webserver"
+    if [[ "$(json_value "$WORK_DIR/current.json" dirroot)" == "$MOODLE_PATH" && "$(cat "$BACKUP_DIR/webserver/changed")" == 0 ]]; then
+        die "No matching webroot directive found. Configure public/ manually and use --skip-webroot-update."
+    fi
+    web_configtest
+}
+restart_workers() {
+    web_configtest
+    systemctl restart "$WEB_SERVICE"
+    systemctl is-active --quiet "$WEB_SERVICE"
+    local unit
+    # Restart only this site's selected PHP services, not every pool on the host.
+    for unit in "${FPM_SERVICES[@]}"; do
+        systemctl restart "$unit"
+        systemctl is-active --quiet "$unit"
+    done
+}
+restore_web_configs() {
+    [[ "$WEB_CHANGED" == true && -d "$BACKUP_DIR/webserver" ]] || return 0
+    local file rel
+    while IFS= read -r -d '' file; do
+        rel=${file#"$BACKUP_DIR/webserver"}
+        [[ "$rel" == /etc/* ]] || continue
+        cp -p "$file" "$rel" || return 1
+    done < <(find "$BACKUP_DIR/webserver/etc" -type f -print0)
+}
+cleanup() {
+    local status=$?
+    trap - EXIT INT TERM HUP
+    set +e
+    [[ -z "$WORK_DIR" ]] || chmod 700 "$WORK_DIR"
+    [[ -z "$DB_AUTH_FILE" ]] || rm -f "$DB_AUTH_FILE"
+    if [[ "$SUCCESS" != true && "$PHASE" != preflight ]]; then
+        if [[ "$PHASE" == migrating || "$PHASE" == verifying || "$PHASE" == awaiting-restart ]]; then
+            # Never undo a potentially committed schema migration automatically.
+            if [[ ! -e "$DATA_PATH/climaintenance.html" ]]; then
+                printf '<h1>Maintenance</h1><p>Update recovery is required.</p>\n' > "$DATA_PATH/climaintenance.html"
+                chmod 644 "$DATA_PATH/climaintenance.html"
+            fi
+            re_pause_cron || error "Cannot re-pause cron; inspect scheduler state"
+            error "New code, maintenance and paused cron are retained until recovery/restart is complete."
+            error "Restore code AND database together from $BACKUP_DIR, or repair and finish the upgrade."
+            error "Private state/logs: $WORK_DIR"
+            [[ "$PHASE" == awaiting-restart ]] || status=1
+        else
+            local recovered=true
+            if [[ "$CODE_SWAPPED" == true ]]; then
+                mv "$MOODLE_PATH" "$STAGE_DIR/failed-code" && mv "$OLD_CODE" "$MOODLE_PATH" || recovered=false
+            elif [[ "$OLD_MOVED" == true ]]; then
+                mv "$OLD_CODE" "$MOODLE_PATH" || recovered=false
+            fi
+            restore_web_configs || recovered=false
+            if [[ "$recovered" == true ]]; then
+                if [[ "$OLD_MOVED" == true ]]; then restart_workers || recovered=false; fi
+                if [[ "$recovered" == true ]]; then
+                    disable_maintenance_mode || recovered=false
+                    restore_cron || recovered=false
                 fi
             fi
-            
-            # Clean up credentials file
-            rm -f "$mysql_opts_file"
-        else
-            warning "mysqldump not found - MySQL backup skipped"
+            if [[ "$recovered" != true ]]; then error "Recovery incomplete; inspect $WORK_DIR and $BACKUP_DIR"; status=1; fi
         fi
-    elif [[ "$db_type" == "pgsql" ]]; then
-        if command -v pg_dump &> /dev/null; then
-            log "Creating PostgreSQL backup..."
-            export PGPASSWORD="$db_pass"
-            if pg_dump -h "$db_host" -p "$db_port" -U "$db_user" \
-                --no-password \
-                --clean \
-                --create \
-                "$db_name" > "$backup_dir/database_backup.sql" 2>/dev/null; then
-                success "PostgreSQL backup created ($(du -h "$backup_dir/database_backup.sql" | cut -f1))"
-            else
-                warning "PostgreSQL backup failed - check credentials and permissions"
-            fi
-            unset PGPASSWORD
-        else
-            warning "pg_dump not found - PostgreSQL backup skipped"
-        fi
-    else
-        warning "Unknown database type: $db_type - backup skipped"
     fi
+    # Keep private working state on failure for diagnosis and cron recovery.
+    if [[ "$SUCCESS" == true || "$PHASE" == preflight ]]; then
+        [[ -z "$STAGE_DIR" ]] || rm -rf -- "$STAGE_DIR"
+        [[ -z "$WORK_DIR" ]] || rm -rf -- "$WORK_DIR"
+    fi
+    [[ -z "$LOCK_DIR" ]] || rmdir "$LOCK_DIR" 2>/dev/null
+    exit "$status"
 }
 
-# Download and install Moodle
-download_and_install_moodle() {
-    local version=$1
-    local moodle_path=$2
-    local backup_dir=$3
-    local download_url=$4
-    local ref_label=$5
-    
-    local temp_dir="/tmp/moodle_download_$$"
-    local archive_file="$temp_dir/moodle.tar.gz"
-    local config_backup="$backup_dir/config.php.before-install"
-    
-    log "Downloading Moodle $version from $ref_label..."
-    
-    mkdir -p "$temp_dir"
-    
-    if ! curl -L --fail --progress-bar "$download_url" -o "$archive_file"; then
-        error "Download failed"
-        exit 1
-    fi
-    
-    log "Extracting Moodle..."
-    tar -xzf "$archive_file" -C "$temp_dir"
-
-    local extracted_dir
-    extracted_dir=$(find "$temp_dir" -mindepth 1 -maxdepth 1 -type d | head -1)
-    if [[ -z "$extracted_dir" ]]; then
-        error "Downloaded archive did not contain a Moodle directory"
-        exit 1
-    fi
-
-    if [[ ! -f "$extracted_dir/admin/cli/upgrade.php" ]]; then
-        error "Downloaded archive does not look like a Moodle source tree"
-        exit 1
-    fi
-    
-    # Backup old config.php
-    if [[ -f "$moodle_path/config.php" ]]; then
-        cp "$moodle_path/config.php" "$config_backup"
-    fi
-    
-    log "Installing new Moodle version..."
-    
-    # Remove old Moodle code (except config.php and moodledata)
-    find "$moodle_path" -mindepth 1 -maxdepth 1 ! -name 'config.php' ! -name 'moodledata' -exec rm -rf {} +
-    
-    # Copy new files, including dotfiles.
-    cp -a "$extracted_dir"/. "$moodle_path/"
-    
-    # Restore old config.php
-    if [[ -f "$config_backup" ]]; then
-        cp "$config_backup" "$moodle_path/config.php"
-    fi
-    
-    # Set permissions
-    chown -R www-data:www-data "$moodle_path" 2>/dev/null || true
-    chmod -R 755 "$moodle_path"
-    
-    # Clean up temp directory
-    rm -rf "$temp_dir"
-    
-    success "Moodle $version has been installed"
-}
-
-set_php_ini_value() {
-    local ini_file=$1
-    local key=$2
-    local value=$3
-
-    if [[ ! -f "$ini_file" || ! -w "$ini_file" ]]; then
-        return
-    fi
-
-    cp "$ini_file" "${ini_file}.bak.$(date +%Y%m%d_%H%M%S)" 2>/dev/null || true
-
-    if grep -Eq "^[;[:space:]]*${key}[[:space:]]*=" "$ini_file"; then
-        sed -i -E "s/^[;[:space:]]*${key}[[:space:]]*=.*/${key} = ${value}/" "$ini_file"
-    else
-        printf '\n%s = %s\n' "$key" "$value" >> "$ini_file"
-    fi
-}
-
-ensure_max_input_vars() {
-    local required=5000
-    local current
-    current=$(php -r "echo ini_get('max_input_vars');")
-
-    if [[ "$current" -ge "$required" ]]; then
-        return
-    fi
-
-    warning "max_input_vars is $current, should be at least $required"
-
-    local php_version
-    php_version=$(php -r "echo PHP_MAJOR_VERSION.'.'.PHP_MINOR_VERSION;")
-
-    local loaded_ini
-    loaded_ini=$(php --ini 2>/dev/null | awk -F': ' '/Loaded Configuration File/ {print $2}' | head -1)
-    [[ "$loaded_ini" == "(none)" ]] && loaded_ini=""
-
-    local ini_candidates=()
-    [[ -n "$loaded_ini" ]] && ini_candidates+=("$loaded_ini")
-    ini_candidates+=(
-        "/etc/php/$php_version/cli/php.ini"
-        "/etc/php/$php_version/apache2/php.ini"
-        "/etc/php/$php_version/fpm/php.ini"
-    )
-
-    local ini_file
-    for ini_file in "${ini_candidates[@]}"; do
-        set_php_ini_value "$ini_file" "max_input_vars" "$required"
-    done
-
-    local pool_conf="/etc/php/$php_version/fpm/pool.d/www.conf"
-    if [[ -f "$pool_conf" && -w "$pool_conf" ]]; then
-        if grep -q "php_admin_value\[max_input_vars\]" "$pool_conf"; then
-            sed -i -E "s/php_admin_value\[max_input_vars\][[:space:]]*=.*/php_admin_value[max_input_vars] = $required/" "$pool_conf"
-        else
-            printf '\nphp_admin_value[max_input_vars] = %s\n' "$required" >> "$pool_conf"
-        fi
-        systemctl reload "php$php_version-fpm" 2>/dev/null || true
-    fi
-
-    current=$(php -r "echo ini_get('max_input_vars');")
-    if [[ "$current" -lt "$required" ]]; then
-        warning "CLI max_input_vars is still $current; Moodle CLI commands will run with -d max_input_vars=$required"
-    else
-        success "max_input_vars updated to $current"
-    fi
-}
-
-# Run Moodle upgrade with environment fixes
-run_moodle_upgrade() {
-    local moodle_path=$1
-    
-    log "Running Moodle upgrade..."
-    
-    if [[ ! -f "$moodle_path/admin/cli/upgrade.php" ]]; then
-        error "Upgrade script not found"
-        exit 1
-    fi
-    
-    # Pre-upgrade environment checks and fixes
-    log "Checking and fixing environment issues..."
-    ensure_max_input_vars
-    
-    # Run the upgrade
-    cd "$moodle_path"
-    
-    # Check if user wants to handle database upgrade manually
-    if ask_yes_no "Do you want the script to automatically upgrade the database?"; then
-        log "Running automatic database upgrade..."
-        local upgrade_args=(admin/cli/upgrade.php --non-interactive)
-        if [[ "$TARGET_IS_UNSTABLE" == "true" ]]; then
-            upgrade_args+=(--allow-unstable)
-        fi
-
-        if php -d max_input_vars=5000 "${upgrade_args[@]}"; then
-            success "Moodle upgrade completed successfully"
-        else
-            error "Moodle upgrade failed"
-            warning "You may need to run the upgrade manually:"
-            warning "cd $moodle_path && php -d max_input_vars=5000 admin/cli/upgrade.php"
-            exit 1
-        fi
-    else
-        log "Skipping automatic database upgrade"
-        warning "You will need to complete the upgrade manually:"
-        warning "1. Via web interface: Visit your Moodle site and follow the upgrade wizard"
-        warning "2. Via CLI: cd $moodle_path && php -d max_input_vars=5000 admin/cli/upgrade.php"
-        
-        if ask_yes_no "Do you want to run the upgrade now via CLI?"; then
-            log "Running CLI upgrade..."
-            php -d max_input_vars=5000 admin/cli/upgrade.php
-        fi
-    fi
-    
-    # Post-upgrade optimizations
-    log "Running post-upgrade optimizations..."
-    
-    # Clear all caches
-    if [[ -f "$moodle_path/admin/cli/purge_caches.php" ]]; then
-        php -d max_input_vars=5000 admin/cli/purge_caches.php 2>/dev/null || true
-        log "Caches purged"
-    fi
-    
-    # Fix file permissions after upgrade
-    if [[ -d "$moodle_path" ]]; then
-        chown -R www-data:www-data "$moodle_path" 2>/dev/null || true
-        find "$moodle_path" -type d -exec chmod 755 {} + 2>/dev/null || true
-        find "$moodle_path" -type f -exec chmod 644 {} + 2>/dev/null || true
-        chmod 600 "$moodle_path/config.php" 2>/dev/null || true
-        log "File permissions fixed"
-    fi
-}
-
-set_config_maintenance_flag() {
-    local moodle_path=$1
-    local enabled=$2
-
-    if [[ -f "$moodle_path/config.php" ]]; then
-        cp "$moodle_path/config.php" "$moodle_path/config.php.maintenance_backup"
-        sed -i '/\$CFG->maintenance_enabled/d' "$moodle_path/config.php"
-
-        if [[ "$enabled" == "true" ]]; then
-            if grep -q "require_once.*lib/setup.php" "$moodle_path/config.php"; then
-                sed -i '/require_once.*lib\/setup.php/i \$CFG->maintenance_enabled = true;' "$moodle_path/config.php"
-            elif grep -q "setup.php" "$moodle_path/config.php"; then
-                sed -i '/setup.php/i \$CFG->maintenance_enabled = true;' "$moodle_path/config.php"
-            else
-                printf '\n$CFG->maintenance_enabled = true;\n' >> "$moodle_path/config.php"
-            fi
-        fi
-    fi
-}
-
-enable_maintenance_mode() {
-    local moodle_path=$1
-
-    log "Enabling maintenance mode..."
-
-    if [[ -f "$moodle_path/admin/cli/maintenance.php" ]]; then
-        if php -d max_input_vars=5000 "$moodle_path/admin/cli/maintenance.php" --enable >/dev/null 2>&1; then
-            success "Maintenance mode enabled"
-            return
-        fi
-    fi
-
-    set_config_maintenance_flag "$moodle_path" true
-    success "Maintenance mode enabled"
-}
-
-# Disable maintenance mode
-disable_maintenance_mode() {
-    local moodle_path=$1
-
-    log "Disabling maintenance mode..."
-
-    if [[ -f "$moodle_path/admin/cli/maintenance.php" ]]; then
-        if php -d max_input_vars=5000 "$moodle_path/admin/cli/maintenance.php" --disable >/dev/null 2>&1; then
-            success "Maintenance mode disabled"
-            return
-        fi
-    fi
-
-    if [[ -f "$moodle_path/config.php" ]]; then
-        set_config_maintenance_flag "$moodle_path" false
-        success "Maintenance mode disabled"
-    else
-        warning "config.php not found - maintenance mode could not be disabled"
-    fi
-}
-
-dedupe_lines() {
-    awk '!seen[$0]++'
-}
-
-update_webroot_for_public_dir() {
-    local moodle_path=$1
-    local public_path="$moodle_path/public"
-    local changed=false
-    local timestamp
-    timestamp=$(date +%Y%m%d_%H%M%S)
-
-    if [[ "$SKIP_WEBROOT_UPDATE" == "true" ]]; then
-        return
-    fi
-
-    if [[ ! -d "$public_path" || ! -f "$public_path/config.php" ]]; then
-        return
-    fi
-
-    log "Checking web server DocumentRoot for Moodle public directory..."
-
-    local apache_files=()
-    if [[ -d /etc/apache2 ]]; then
-        while IFS= read -r file; do
-            apache_files+=("$file")
-        done < <(find /etc/apache2/sites-available /etc/apache2/sites-enabled -type f 2>/dev/null | dedupe_lines)
-    fi
-
-    local file
-    for file in "${apache_files[@]}"; do
-        if grep -Eq "DocumentRoot[[:space:]]+\"?${moodle_path}/?\"?" "$file"; then
-            [[ -f "${file}.bak.${timestamp}" ]] || cp "$file" "${file}.bak.${timestamp}"
-            perl -0pi -e "s#(DocumentRoot\\s+)([\"']?)\\Q${moodle_path}\\E/?([\"']?)#\$1\$2${public_path}\$3#g" "$file"
-            success "Updated Apache DocumentRoot in $file"
-            changed=true
-        fi
-
-        if grep -Eq "<Directory[[:space:]]+\"?${moodle_path}/?\"?>" "$file"; then
-            [[ -f "${file}.bak.${timestamp}" ]] || cp "$file" "${file}.bak.${timestamp}" 2>/dev/null || true
-            perl -0pi -e "s#(<Directory\\s+)([\"']?)\\Q${moodle_path}\\E/?([\"']?\\s*>)#\$1\$2${public_path}\$3#g" "$file"
-            success "Updated Apache Directory block in $file"
-            changed=true
-        fi
-    done
-
-    local nginx_files=()
-    if [[ -d /etc/nginx ]]; then
-        while IFS= read -r file; do
-            nginx_files+=("$file")
-        done < <(find /etc/nginx/sites-available /etc/nginx/sites-enabled -type f 2>/dev/null | dedupe_lines)
-    fi
-
-    for file in "${nginx_files[@]}"; do
-        if grep -Eq "root[[:space:]]+${moodle_path}/?;" "$file"; then
-            cp "$file" "${file}.bak.${timestamp}"
-            perl -0pi -e "s#(root\\s+)\\Q${moodle_path}\\E/?;#\$1${public_path};#g" "$file"
-            success "Updated Nginx root in $file"
-            changed=true
-        fi
-    done
-
-    if [[ "$changed" != "true" ]]; then
-        warning "Moodle now contains a public/ webroot, but no matching Apache/Nginx root was updated."
-        warning "Set your web server root to: $public_path"
-    fi
-}
-
-# Main function
 main() {
     parse_args "$@"
-    set -- "${POSITIONAL_ARGS[@]}"
-
-    echo "=================================="
-    echo "      Moodle Updater v1.1"
-    echo "=================================="
-    echo
-    
-    # Check parameters
-    if [[ $# -lt 2 ]]; then
-        usage
-        exit 1
+    [[ ${#POSITIONAL_ARGS[@]} -ge 2 && ${#POSITIONAL_ARGS[@]} -le 3 ]] || { usage >&2; exit 1; }
+    [[ $EUID == 0 ]] || die "Run as root (CLI upgrades themselves run as the web user)"
+    (( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 4) )) || die "Bash 4.4 or later is required"
+    local cmd requested code_parent target_public target_release web_group owner config_group unit
+    for cmd in "$PHP_BIN" curl tar find cp mv du df stat runuser systemctl mktemp; do require_command "$cmd"; done
+    "$PHP_BIN" -r 'exit(version_compare(PHP_VERSION,"8.1",">=")?0:1);' || die "The updater requires PHP 8.1 or later"
+    "$PHP_BIN" -r 'exit(extension_loaded("simplexml")?0:1);' || die "PHP SimpleXML is required"
+    [[ ! -L "${POSITIONAL_ARGS[0]}" ]] || die "Pass the real code directory, not a symlink"
+    MOODLE_PATH=$(cd "${POSITIONAL_ARGS[0]}" && pwd -P)
+    DATA_PATH=$(cd "${POSITIONAL_ARGS[1]}" && pwd -P)
+    [[ -f "$MOODLE_PATH/config.php" ]] || die "config.php not found"
+    [[ "$MOODLE_PATH" != / && "$DATA_PATH" != / ]] || die "Root paths are not allowed"
+    [[ "$DATA_PATH/" != "$MOODLE_PATH/"* && "$MOODLE_PATH/" != "$DATA_PATH/"* ]] || die "Code and moodledata must be separate, non-nested directories"
+    code_parent=$(dirname "$MOODLE_PATH")
+    [[ "$(stat -c %d "$MOODLE_PATH")" == "$(stat -c %d "$code_parent")" ]] || die "Code mount points cannot be swapped atomically"
+    LOCK_DIR="$code_parent/.moodle-updater-$(basename "$MOODLE_PATH").lock"
+    mkdir "$LOCK_DIR" 2>/dev/null || { LOCK_DIR=; die "Another updater is running (or a stale lock needs review)"; }
+    trap cleanup EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM HUP
+    WORK_DIR=$(mktemp -d /var/tmp/moodle-updater.XXXXXX)
+    STAGE_DIR=$(mktemp -d "$code_parent/.moodle-updater-stage.XXXXXX")
+    write_helper
+    owner=$(stat -c %U "$MOODLE_PATH/config.php")
+    config_group=$(stat -c %G "$MOODLE_PATH/config.php")
+    if [[ -z "$WEB_USER" && "$owner" == root && "$config_group" != root ]] &&
+        id "$config_group" >/dev/null 2>&1 && [[ "$(id -gn "$config_group")" == "$config_group" ]]; then
+        WEB_USER=$config_group
     fi
-    
-    local moodle_path="$1"
-    local moodledata_path="$2"
-    local target_version="${3:-}"
-    
-    # Validate paths
-    if [[ ! -d "$moodle_path" ]]; then
-        error "Moodle path does not exist: $moodle_path"
-        exit 1
-    fi
-    
-    if [[ ! -d "$moodledata_path" ]]; then
-        error "Moodledata path does not exist: $moodledata_path"
-        exit 1
-    fi
-
-    moodle_path=$(cd "$moodle_path" && pwd -P)
-    moodledata_path=$(cd "$moodledata_path" && pwd -P)
-    
-    # Check root permissions
-    if [[ $EUID -ne 0 ]]; then
-        warning "Script is not running as root. Some operations might fail."
-    fi
-    
-    # Get current version
-    local current_version=$(get_current_moodle_version "$moodle_path")
-    log "Current Moodle version: $current_version"
-    
-    # Get available versions
-    log "Loading available Moodle versions..."
-    local available_versions=$(get_latest_moodle_versions)
-    local latest_version=$(echo "$available_versions" | head -1)
-    local dev_version=$(get_main_dev_version)
-
-    if [[ -z "$available_versions" ]]; then
-        error "Could not load Moodle versions from GitHub"
-        exit 1
-    fi
-    
-    log "Latest available version: $latest_version"
-    echo
-    echo "Available versions:"
-    echo "$available_versions" | head -5
-    if [[ -n "$dev_version" ]]; then
-        echo
-        echo "Development version:"
-        echo "$dev_version (main, requires --allow-unstable)"
-    fi
-    echo
-    
-    # Determine target version
-    if [[ -z "$target_version" ]]; then
-        if [[ "$ASSUME_YES" == "true" ]]; then
-            target_version="$latest_version"
-        else
-            echo "Recommended version: $latest_version"
-            read -p "Enter desired target version (or press Enter for $latest_version): " target_version
-
-            if [[ -z "$target_version" ]]; then
-                target_version="$latest_version"
-            fi
+    WEB_USER=${WEB_USER:-$owner}
+    [[ "$WEB_USER" != root ]] || die "config.php is owned by root; specify --web-user explicitly"
+    id "$WEB_USER" >/dev/null || die "Unknown web user"
+    web_group=$(id -gn "$WEB_USER")
+    runuser -u "$WEB_USER" -- test -r "$MOODLE_PATH/config.php" || die "The web user cannot read config.php"
+    # Reading Moodle bootstrap can create cache files: use its own service user.
+    chmod 711 "$WORK_DIR"
+    chmod 644 "$WORK_DIR/helper.php"
+    runuser -u "$WEB_USER" -- "$PHP_BIN" "$WORK_DIR/helper.php" inspect "$MOODLE_PATH" > "$WORK_DIR/current.json"
+    chmod 700 "$WORK_DIR"
+    [[ "$(json_value "$WORK_DIR/current.json" dataroot)" == "$DATA_PATH" ]] || die "Supplied moodledata does not match config.php"
+    if [[ -d "$MOODLE_PATH/.git" ]]; then
+        require_command git
+        if ! git -c safe.directory="$MOODLE_PATH" -C "$MOODLE_PATH" diff --quiet ||
+            ! git -c safe.directory="$MOODLE_PATH" -C "$MOODLE_PATH" diff --cached --quiet; then
+            die "Tracked core changes require manual review"
         fi
     fi
-
-    resolve_moodle_target "$target_version" "$available_versions"
-    target_version="$RESOLVED_TARGET_VERSION"
-
-    log "Target version: $target_version"
-    log "Download source: $TARGET_REF_LABEL"
-    if [[ "$TARGET_IS_UNSTABLE" == "true" ]]; then
-        warning "Target is not a stable release. Use this only for staging/test systems."
-    fi
-    
-    # Validate version
-    if [[ "$current_version" != "unknown" ]]; then
-        local version_cmp=$(version_compare "$current_version" "$TARGET_VERSION_FOR_COMPARE")
-        
-        if [[ "$version_cmp" == "0" ]]; then
-            warning "Target version is identical to current version"
-            if ! ask_yes_no "Continue anyway?"; then
-                exit 0
-            fi
-        elif [[ "$version_cmp" == "1" ]]; then
-            error "Downgrade from $current_version to $target_version not allowed"
-            exit 1
+    for cmd in apache2 httpd nginx; do
+        if systemctl is-active --quiet "$cmd"; then
+            [[ -z "$WEB_SERVICE" ]] || die "Multiple active web servers; configure the deployment manually"
+            WEB_SERVICE=$cmd
         fi
+    done
+    if [[ ${#FPM_SERVICES[@]} == 0 ]]; then
+        unit="php$("$PHP_BIN" -r 'echo PHP_MAJOR_VERSION,".",PHP_MINOR_VERSION;')-fpm.service"
+        if systemctl is-active --quiet "$unit"; then FPM_SERVICES+=("$unit")
+        elif systemctl is-active --quiet php-fpm.service; then FPM_SERVICES+=(php-fpm.service); fi
     fi
-    
-    # Check PHP requirements
-    check_php_requirements "$target_version"
-    
-    # Check and upgrade MariaDB/MySQL if needed
-    check_and_upgrade_mariadb "$target_version"
-    
-    # Get confirmation
-    echo
-    warning "WARNING: Backup will be created automatically, but please ensure"
-    warning "you have a complete system backup!"
-    echo
-    
-    if ! ask_yes_no "Update Moodle from $current_version to $target_version?"; then
-        log "Update cancelled"
-        exit 0
+    for unit in "${FPM_SERVICES[@]}"; do
+        systemctl is-active --quiet "$unit" || die "FPM service is not active: $unit"
+    done
+    if [[ "$WEB_SERVICE" == nginx && ${#FPM_SERVICES[@]} == 0 ]]; then
+        die "No PHP-FPM service detected; pass this site's --fpm-service UNIT explicitly"
     fi
-    
-    # Create backup
-    local backup_dir="/tmp/moodle_backup_$(date +%Y%m%d_%H%M%S)"
-    create_backup "$moodle_path" "$moodledata_path" "$backup_dir"
-    backup_database "$moodle_path" "$backup_dir"
-    
-    # Enable maintenance mode
-    enable_maintenance_mode "$moodle_path"
-    
-    # Download and install Moodle
-    download_and_install_moodle "$target_version" "$moodle_path" "$backup_dir" "$TARGET_DOWNLOAD_URL" "$TARGET_REF_LABEL"
-    
-    # Run upgrade
-    run_moodle_upgrade "$moodle_path"
-
-    # Moodle 5.1+ uses a public/ webroot. Update known web server configs before restart.
-    update_webroot_for_public_dir "$moodle_path"
-    
-    # Disable maintenance mode
-    disable_maintenance_mode "$moodle_path"
-    
-    # Restart web server (optional)
-    if [[ "$SKIP_RESTART" != "true" ]] && command -v systemctl &> /dev/null; then
-        if ask_yes_no "Restart web server?"; then
-            systemctl restart apache2 2>/dev/null || systemctl restart nginx 2>/dev/null || true
-        fi
+    web_configtest
+    requested=${POSITIONAL_ARGS[2]:-latest}
+    resolve_moodle_target "$requested"
+    check_staging_space
+    prepare_target
+    php_helper requirements "$WORK_DIR/current.json" "$STAGE_DIR/new" "$ALLOW_UNSTABLE"
+    if [[ "$(json_value "$WORK_DIR/target-metadata.json" version)" == "$(json_value "$WORK_DIR/current.json" build)" ]]; then
+        log "Installed build already matches the target; no changes needed"
+        SUCCESS=true; return 0
     fi
-    
-    success "Moodle update completed successfully!"
-    success "New version: $target_version"
-    success "Backup saved in: $backup_dir"
-    success "Maintenance mode: DISABLED"
-    
-    # Show important post-upgrade information
-    echo
-    log "=== POST-UPGRADE CHECKLIST ==="
-    log "1. Test your Moodle installation thoroughly"
-    log "2. Check Admin → Server → Environment for any warnings"
-    log "3. Review Admin → Reports → Config changes"
-    log "4. Verify user permissions and course access"
-    log "5. Test email functionality"
-    log "6. Check that plugins are working correctly"
-    
-    # Environment status check
-    echo
-    log "=== ENVIRONMENT STATUS ==="
-    
-    # Check MariaDB version after potential upgrade
-    local final_db_version=$(mysql --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "unknown")
-    local db_type_final=$(mysql --version 2>/dev/null | grep -i mariadb &>/dev/null && echo "MariaDB" || echo "MySQL")
-    
-    if [[ "$final_db_version" != "unknown" ]]; then
-        success "$db_type_final version: $final_db_version"
-        
-        local required_final_db="8.0.0"
-        if [[ "$db_type_final" == "MariaDB" ]]; then
-            required_final_db="10.6.7"
-        fi
-        if version_at_least "$target_version" "5.0"; then
-            if [[ "$db_type_final" == "MariaDB" ]]; then
-                required_final_db="10.11.0"
-            else
-                required_final_db="8.4.0"
-            fi
-        fi
-
-        if [[ "$db_type_final" == "MariaDB" ]]; then
-            db_type_final="MariaDB"
-        fi
-
-        if version_at_least "$final_db_version" "$required_final_db"; then
-            success "$db_type_final version meets Moodle requirements"
-        else
-            warning "$db_type_final version is below $required_final_db - consider manual upgrade"
-        fi
+    php_helper preserve "$WORK_DIR/current.json" "$STAGE_DIR/new" "${PRESERVE_PATHS[@]}"
+    cp -p "$MOODLE_PATH/config.php" "$STAGE_DIR/new/config.php"
+    target_public=false
+    [[ ! -f "$STAGE_DIR/new/public/config.php" ]] || target_public=true
+    php_helper bootstrap "$STAGE_DIR/new/config.php" "$target_public"
+    case "$(json_value "$WORK_DIR/current.json" dbvendor)" in
+        postgres) require_command pg_dump; require_command pg_restore ;;
+        *) require_command mysqldump ;;
+    esac
+    [[ "$BACKUP_ROOT" == /* ]] || die "--backup-dir must be absolute"
+    BACKUP_ROOT=$(php_helper canonical "$BACKUP_ROOT")
+    [[ "$BACKUP_ROOT/" != "$MOODLE_PATH/"* && "$BACKUP_ROOT/" != "$DATA_PATH/"* ]] || die "Backups must be outside code and moodledata"
+    [[ "$MOODLE_PATH/" != "$BACKUP_ROOT/"* && "$DATA_PATH/" != "$BACKUP_ROOT/"* ]] || die "Backup parent may not contain code or moodledata"
+    mkdir -p "$BACKUP_ROOT"
+    check_disk_space
+    validate_cron_sources
+    target_release=$(json_value "$WORK_DIR/target-metadata.json" release)
+    log "Plan: $(json_value "$WORK_DIR/current.json" release) -> $target_release; web user $WEB_USER"
+    if [[ "$DRY_RUN" == true ]]; then log "Dry run passed. No code, database, maintenance, cron or web server settings changed."; SUCCESS=true; return 0; fi
+    ask_yes_no "Update Moodle to $target_release with a $BACKUP_MODE backup?" || { log "Cancelled"; SUCCESS=true; return 0; }
+    BACKUP_DIR=$(mktemp -d "$BACKUP_ROOT/$(basename "$MOODLE_PATH")-$(date +%Y%m%d_%H%M%S).XXXXXX")
+    if [[ -f "$DATA_PATH/climaintenance.html" ]]; then
+        INITIAL_CLI_MAINTENANCE=true
+        cp -p "$DATA_PATH/climaintenance.html" "$WORK_DIR/original-maintenance.html"
     fi
-    
-    local current_max_vars=$(php -r "echo ini_get('max_input_vars');")
-    if [[ "$current_max_vars" -ge 5000 ]]; then
-        success "max_input_vars: $current_max_vars (sufficient)"
-    else
-        warning "max_input_vars is still $current_max_vars - should be 5000+"
-        log "Add this to your PHP configuration:"
-        log "max_input_vars = 5000"
+    PHASE=quiescing
+    pause_cron
+    enable_maintenance_mode
+    wait_for_cron
+    PHASE=backing-up
+    create_backup
+    # Retain the invocation and all non-secret diagnostics with the backup.
+    cp "$0" "$BACKUP_DIR/updater.sh"
+    PHASE=installing
+    chown -R "root:$web_group" "$STAGE_DIR/new"
+    find "$STAGE_DIR/new" -type d -exec chmod 755 {} +
+    find "$STAGE_DIR/new" -type f -exec chmod u=rwX,go=rX {} +
+    chmod 640 "$STAGE_DIR/new/config.php"
+    OLD_CODE="$STAGE_DIR/old"
+    mv "$MOODLE_PATH" "$OLD_CODE"; OLD_MOVED=true
+    mv "$STAGE_DIR/new" "$MOODLE_PATH"; CODE_SWAPPED=true
+    update_webroot_for_public_dir
+    # From this point onward, a failed command may have committed DB changes.
+    PHASE=migrating
+    local upgrade_args=(--non-interactive)
+    [[ "$(json_value "$WORK_DIR/target.json" unstable)" != true ]] || upgrade_args+=(--allow-unstable)
+    log "Running Moodle database upgrade as $WEB_USER; log: $BACKUP_DIR/upgrade.log"
+    as_web "$MOODLE_PATH/admin/cli/upgrade.php" "${upgrade_args[@]}" > "$BACKUP_DIR/upgrade.log" 2>&1
+    PHASE=verifying
+    as_web "$MOODLE_PATH/admin/cli/purge_caches.php" >> "$BACKUP_DIR/upgrade.log" 2>&1
+    as_web "$MOODLE_PATH/admin/cli/upgrade.php" --is-pending >> "$BACKUP_DIR/upgrade.log" 2>&1
+    chmod 711 "$WORK_DIR"
+    runuser -u "$WEB_USER" -- "$PHP_BIN" "$WORK_DIR/helper.php" inspect "$MOODLE_PATH" > "$BACKUP_DIR/after.json"
+    chmod 700 "$WORK_DIR"
+    [[ "$(json_value "$BACKUP_DIR/after.json" build)" == "$(json_value "$WORK_DIR/target-metadata.json" version)" ]] || die "Installed database build does not match downloaded code"
+    if [[ "$INITIAL_CLI_MAINTENANCE" == true ]]; then
+        cp -p "$WORK_DIR/original-maintenance.html" "$DATA_PATH/climaintenance.html"
     fi
-    
-    # Check if emergency backup was created
-    if [[ -f "/tmp/last_emergency_backup_path" ]]; then
-        local emergency_path=$(cat /tmp/last_emergency_backup_path)
-        log "Emergency database backup available at: $emergency_path"
+    if [[ "$SKIP_RESTART" == true ]]; then
+        PHASE=awaiting-restart
+        error "Upgrade completed; --no-restart intentionally leaves maintenance and cron paused."
+        error "Restart web/PHP workers, verify the site, then disable CLI maintenance and restore saved crontabs."
+        error "Backup: $BACKUP_DIR; recovery state: $WORK_DIR"
+        # Keep the state and the old tree for a manual handoff; exit distinctly.
+        exit 2
     fi
-    
-    log "For asynchronous backups, see: Admin → Server → Asynchronous backups"
-    
-    # Final status check
-    if grep -q "maintenance_enabled.*true" "$moodle_path/config.php" 2>/dev/null; then
-        warning "WARNING: Maintenance mode appears to still be active!"
-        warning "Manually disable with: sed -i '/maintenance_enabled.*true/d' $moodle_path/config.php"
-    else
-        success "Maintenance mode successfully disabled - site is online!"
-    fi
+    restart_workers
+    disable_maintenance_mode
+    restore_cron
+    SUCCESS=true
+    PHASE=complete
+    printf 'Upgrade and cache purge completed; workers restarted; prior maintenance/cron state restored.\n' > "$BACKUP_DIR/UPDATE_COMPLETE"
+    log "Updated to $target_release. Backup retained: $BACKUP_DIR"
 }
 
-# Execute script
-main "$@"
+# Sourceable functions make fixture tests possible without root or a Moodle site.
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then main "$@"; fi
